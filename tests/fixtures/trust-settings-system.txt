@@ -1,0 +1,44 @@
+Number of trust settings : 0
+Cert 54: QuoVadis Root CA 3 G3
+   Number of trust settings : 0
+Cert 55: emSign ECC Root CA - G3
+   Number of trust settings : 0
+Cert 56: Apple Platform ECC Root CA - G1
+   Number of trust settings : 0
+Cert 57: HARICA Client RSA Root CA 2021
+   Number of trust settings : 0
+Cert 58: Certum Trusted Network CA 2
+   Number of trust settings : 0
+Cert 59: NetLock Arany (Class Gold) Főtanúsítvány
+   Number of trust settings : 0
+Cert 60: NAVER Global Root Certification Authority
+--
+   Number of trust settings : 0
+Cert 79: Apple Platform Developer RSA Root CA - G1
+   Number of trust settings : 0
+Cert 80: AAA Certificate Services
+   Number of trust settings : 0
+Cert 81: DigiCert Global Root G2
+   Number of trust settings : 0
+Cert 82: GlobalSign Secure Mail Root R45
+   Number of trust settings : 0
+Cert 83: Trustwave Global ECC P256 Certification Authority
+   Number of trust settings : 0
+Cert 84: QuoVadis Root CA 3
+   Number of trust settings : 0
+Cert 85: Global Chambersign Root - 2008
+--
+   Number of trust settings : 0
+Cert 130: D-TRUST Root Class 3 CA 2 EV 2009
+   Number of trust settings : 0
+Cert 131: emSign Root CA - G1
+   Number of trust settings : 0
+Cert 132: GLOBALTRUST 2020
+   Number of trust settings : 0
+Cert 133: DigiCert Assured ID Root CA
+   Number of trust settings : 0
+Cert 134: Apple Platform Code Signing RSA Root CA - G1
+   Number of trust settings : 0
+Cert 135: GTS Root R4
+   Number of trust settings : 0
+Cert 136: DigiCert Global Root CA
