@@ -3,13 +3,18 @@
 # October 2026 eMudhra/emSign intermediate CA key compromise. One script for
 # developers (run as yourself) and for Jamf (run as root). Stock bash 3.2.
 #
-# How certificates are judged (folded in from the v2.0 review build):
+# How certificates are judged:
 #   - by public key, against the disclosure site's identities: 4 anchor roots
 #     (emSign ECC/TLS/CS G3, AAA Certificate Services) and the 8 compromised
 #     intermediate keys. Names alone only ever trigger a review.
 #   - strictly: one malformed or non-certificate block = no verdict for the file.
-#   - once: each file is judged once per pass (real path + content hash).
-#   - Java by blocked.certs: fixed when it blocks all 16 compromised certificates.
+#   - once: each file is judged once per pass (by content; a stronger context
+#     for the same file is still reported).
+#   - Java per Oracle's 2026-10-24 guidance (CVE-2026-114820): a JDK is fixed
+#     only when its cacerts no longer trusts the four roots Oracle removed
+#     (emSign ECC Root CA - G3, emSign Root CA - G1, emSign Root CA - G2, AAA
+#     Certificate Services), matched by key. The Oct 21 blocklist builds are
+#     listed as affected; blocked.certs is reported for context only.
 #   - runtimes are probed from / with stdin closed, a time limit, and the
 #     variables that load extra code removed (NODE_OPTIONS, JAVA_TOOL_OPTIONS,
 #     GOTOOLCHAIN downloads...). Every finding carries the fix; each run ends
@@ -19,17 +24,11 @@
 # FLEET MODE (Jamf policy, runs as root)
 # ============================================================================
 # Jamf script parameters:
-#   $4  Mode                 audit | remediate          (default: audit)
-#   $5  blocked.certs URL    optional: newer Oracle list to use instead of the
-#                            embedded one (only when Oracle publishes an update)
-#   $6  blocked.certs SHA256 required with $5
-#   $7  Verbose logging      1 | 0                      (default: 1)
-#   $8  Fail policy if exposed  yes | no                (default: yes)
-#   $9  Run jamf recon after    yes | no                (default: no)
-#   $10 Users to scan        all | console              (default: all)
-#   $11 Also remove the emSign ECC Root CA - G3 alias from unpatched JDK cacerts
-#                            yes | no                   (default: no; the blocklist
-#                            is the fix, root removal is extra and destructive)
+#   $4  Mode                    audit | remediate       (default: audit)
+#   $5  Verbose logging         1 | 0                   (default: 1)
+#   $6  Fail policy if exposed  yes | no                (default: yes)
+#   $7  Run jamf recon after    yes | no                (default: no)
+#   $8  Users to scan           all | console           (default: all)
 #
 # How it runs:
 #   - A system pass (root) checks macOS trust, /etc/ssl/cert.pem and root-owned
@@ -39,17 +38,12 @@
 #     SDKMAN JDKs, Node, Python, Go, Homebrew bundles, ~/.npmrc, Git config.
 #   - Owner rule: a binary is only ever executed by the account that owns it.
 #     Root never runs user-writable binaries.
-#   - Java is judged by lib/security/blocked.certs: a JDK is fixed when it holds
-#     every fingerprint in Oracle's list (embedded below, no download needed).
-#     Patched vendor JDKs keep the emSign root in cacerts; that is expected.
-#   - remediate fixes Java only, unattended: merges Oracle's list into the
-#     blocklist each unpatched JDK reads (lib/security/blocked.certs, or
-#     jre/lib/security/blacklisted.certs on Java 8), with a backup, and verifies
-#     the result. With $11 = yes it also deletes the emSign G3 root alias(es).
-#     AAA Certificate Services is never removed: it anchors unrelated Sectigo
-#     chains, and the blocklist already rejects the cross-signed intermediates.
-#     Node, Homebrew, pip and uv changes need the developer (network installs,
-#     side effects such as extra brew upgrades), so they are reported as actions.
+#   - remediate fixes Java only, unattended: for each JDK whose cacerts still
+#     trusts the four roots, it removes exactly those entries (Oracle's
+#     mitigation for JDKs that cannot be updated yet; the Oct 24 builds ship
+#     the same change). Transaction: verified backup next to cacerts, edit a
+#     staged copy, verify it, then swap it in. Node, Homebrew, pip and uv need
+#     the developer (network installs, side effects), so they are reported.
 #   - IDE-bundled runtimes (IntelliJ, Android Studio) are never edited.
 #
 # Result states (per machine; also the dev-mode result):
@@ -64,7 +58,7 @@
 # Outputs:
 #   - stdout (Jamf policy log) and /var/log/emsign-check.log (rotated at 5 MB)
 #   - /Library/Application Support/emsign-check/status.plist
-#   - exit 0 = PROTECTED or VENDOR_PENDING; 1 = EXPOSED or UNVERIFIED (when $8 = yes);
+#   - exit 0 = PROTECTED or VENDOR_PENDING; 1 = EXPOSED or UNVERIFIED (when $6 = yes);
 #     2 = bad parameters or the script could not run
 #
 # Extension attribute (reads the status file; no rescan at recon):
@@ -77,7 +71,7 @@
 #
 # Local test as root, same code path as Jamf:
 #   sudo ./jamf-emsign.sh / "$(hostname)" "$USER" audit
-#   sudo ./jamf-emsign.sh / "$(hostname)" "$USER" remediate "" "" 1 no no console
+#   sudo ./jamf-emsign.sh / "$(hostname)" "$USER" remediate 1 no no console
 #   or flags:  sudo ./jamf-emsign.sh --mode=audit --verbose --users=console
 #
 # ============================================================================
@@ -85,21 +79,19 @@
 # ============================================================================
 #   ./jamf-emsign.sh [--deep] [--audit-only] [--yes] [--verbose] [--ea] [--no-color]
 #   Audits, then (at a terminal) asks before each fix: Node (nvm), Homebrew,
-#   Java, pip, certifi, uv. --yes approves non-destructive fixes only; removing
-#   Node versions or cacerts roots needs an interactive answer or
-#   --allow-destructive. --remove-roots offers the emSign G3 root removal.
+#   Java root removal, pip, certifi, uv. --yes approves those; removing old
+#   Node versions needs an interactive answer or --allow-destructive.
 #   Exit 0 PROTECTED, 1 VENDOR_PENDING, 2 EXPOSED, 3 UNVERIFIED.
-#   Optional override of the embedded Oracle list (newer file from Oracle):
-#   BLOCKED_CERTS_FILE or BLOCKED_CERTS_URL, plus BLOCKED_CERTS_SHA256
 #
-# Limitation: three compromised intermediates were also cross-signed by
-# Sectigo's AAA Certificate Services root, which stays in every bundle. Only
-# revocation checking or a key-based block (patched Go/Node, blocked.certs)
-# covers that path.
+# Tests: tests/run-tests.sh (bash; uses tests/fixtures, real keytool if present).
+#
+# Limitation: the compromised intermediates were also cross-signed by Sectigo's
+# AAA Certificate Services root. Outside Java (where the root is removed), only
+# a key-based block (patched Node/Go) or revocation checking covers that path.
 
 set -u
 shopt -s nullglob
-VERSION="3.0.0"
+VERSION="3.1.0"
 ORG_DIR="/Library/Application Support/emsign-check"
 STATUS_PLIST="$ORG_DIR/status.plist"
 LOGFILE="${EMSIGN_LOGFILE:-/var/log/emsign-check.log}"
@@ -112,110 +104,10 @@ SYS_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 ME=$(id -un)
 START_EPOCH=$(date +%s)
 
-# ---- Oracle blocked.certs (embedded) ------------------------------------------
-# Oracle's eMudhra blocklist from https://ops.java/emudhra (non-Windows file),
-# downloaded in a browser and verified by the team: 86 SHA-256 fingerprints,
-# including the eMudhra intermediates and their Sectigo cross-signs. Patched
-# vendor JDKs (Oracle/OpenJDK x.0.2, Corretto 21.0.13.0.10, Zulu respins) ship
-# these entries in lib/security/blocked.certs and keep the emSign root in
-# cacerts, so the blocklist (not the root) decides whether a JDK is fixed.
-EMBED_SHA=2596bb6dda83c66d96c5a252d7b2ae1f24cc1ae3f1890223b4f3591a8d52bf10
-embedded_blocklist() {
-cat <<'ORACLE_BLOCKED_CERTS'
-Algorithm=SHA-256
-0164D7CEAE5BB909C272AF151FF44B1177AE9B47D9424B94F1D9558C30934D19
-03DB9E5E79FE6117177F81C11595AF598CB176AF766290DBCEB2C318B32E39A2
-08C396C006A21055D00826A5781A5CCFCE2C8D053AB3C197637A4A7A5BB9A650
-10E7E5BFDB55CFB78D0C21366654046182087A1960C079682513795665AA0C6B
-14E6D2764A4B06701C6CBC376A253775F79C782FBCB6C0EE6F99DE4BA1024ADD
-169A0523C5E071AA4E298286DBD4EE0E40C8C06ABB6B0C077D132F001FA19240
-1C5E6985ACC09221DBD1A4B7BBC6D3A8C3F8540D19F20763A9537FDD42B4FFE7
-1F6BF8A3F2399AF7FD04516C2719C566CBAD51F412738F66D0457E1E6BDE6F2D
-21182E577E5106B669322ABE6086FFF6B101E8C83FD2D01DC32D854961AAC832
-2A464E4113141352C7962FBD1706ED4B88533EF24D7BBA6CCC5D797FD202F1C4
-31C8FD37DB9B56E708B03D1F01848B068C6DA66F36FB5D82C008C6040FA3E133
-33C1BCDC6DA52DF950B3B14121127DA1955F7F31F828497A7608986EB2DDCC09
-37E866582D43C35D7C17D47794B974F291B3047B868DC123382477F7A08AEFA8
-3946901F46B0071E90D78279E82FABABCA177231A704BE72C5B0E8918566EA66
-3B88E4B77FC53C45CA216700E39FC0EA7621A0A40FCB268215082E35D2BD5829
-3C5456D4219BA2372273867FAC9A07104600391E96C7FDCDE3B4420C0F1F69BF
-3E11CF90719F6FB44D94EAC9A156B89BEBE7B8598F28EC58913F2BFCAF91D0C0
-423279423B9FC8CB06F1BB7C3B247522B948D5F18939F378ECC901126DE40BFB
-42C4ACCD12C4F59597925E1A08A7A90102608543809308D50EC427E118BA1493
-432EC25F0D28DE9006D97BF752F17BBB2CD41F669933FCB072D9A1148D0261F3
-450F1B421BB05C8609854884559C323319619E8B06B001EA2DCBB74A23AA3BE2
-45A883F349AEDFD5F3A649B5498FFB121712BA8B448F3F2A91DBC5A766FCDDBE
-4B2460A466F95FD40113BCDCCA2CEB29B3B093921DE45474DA7DF48874C630B1
-4CBBF8256BC9888A8007B2F386940A2E394378B0D903CBB3863C5A6394B889CE
-4DED6F955374E40B8558A611A9719B2AB69AA6852AC50966EDC4B07DE4D4277C
-4FEE0163686ECBD65DB968E7494F55D84B25486D438E9DE558D629D28CD4D176
-50E71B08B9AC407B93D50EE90100CB6B6B41C956DC7AA86C5BAA38AE713CFD6A
-535D04DFCE027C70BD5F8A9E0AD4F218E9AFDCF5BBCF9B6DE0D81E148E2E3172
-558EC6CA13DA9B800FEDC9ACC3C18CA98BB19768F1309B60B5BB89793B3481CB
-568FAF38D9F155F624838E2181B1CEB4D8459305EE652B0F810C97C3611BFE19
-579480AEA166290BD3C643589E795FC0D0E54E86505D180F1DFF99EFD3199512
-585CFE6B7436CBD4E732763A2137D7F49599BA9B1790E688FCEC799C58EB84A6
-59CC5FD35A737B84682EDA26AD23F5ADE8AA847D5BEB3B38AB6CD62347925A66
-5D8FC3ECDDB4DDB243AEE5C306BCFDE670ADF2D66B193DD3AA2D6B2FB91869BE
-5E83124D68D24E8E177E306DF643D5EA99C5A94D6FC34B072F7544A1CABB7C7B
-5F1DED4DD590AF74631290CF073B122A2AAC6A1FA479778A0BD43579BD832699
-62B7F9868263F72F6911FC78CEAF72C1979158B7368BF648683BB2AA39B02E72
-71CB00749B9130FB2707A2664BFF958D0FCC8E161D9674C7450BA0FC2BEAF9D3
-7485B51C0ED192878FA1D2F948FB529AE1842CC5086C4B67F7BE5B2039DE9489
-75D8853BE99C87678E6C7BF9F684B31454D81DEB1C7F37B9FBC026A268337536
-76A45A496031E4DD2D7ED23E8F6FF97DBDEA980BAAC8B0BA94D7EDB551348645
-7BA62FEC54E9D040556FCA70A6A88F03761C178FA1F7CB8390A73076849F55A2
-84112972B8E59D14560AE7E7119654474AAD119990CF3722BFC1E3B91615E1FD
-8A1BD21661C60015065212CC98B1ABB50DFD14C872A208E66BAE890F25C448AF
-8F580C6E34CEE7EE57B93BA9C0AC5FAEDD7BF3085F5EE9C6C0175A2555B111D0
-8FED925362F62FFF90DD835BE6ADC32B02DEC8DF5E82D83E512F1C977D066E82
-912A48745BFF2F14D1798B27858613DE1C0EB03C2BDE630AFD0DDD5251E1EBE1
-98B896625C0C230ADEEC3EB2CF6AAD5001ECF9156A68644E82374CE5833BC25B
-9E39DE2881273ACC225A149C72BA3E0F51424963669AB633EE1DC7DF5DB067B4
-9E7617035CFF537C837E078A7CDC7FD9EB77BCE7DDF3DC6DBD5C50AAFC1F1FA7
-9ED8F9B0E8E42A1656B8E1DD18F42BA42DC06FE52686173BA2FC70E756F207DC
-9FADCE80D62A959F9930D748488C1E22E821F4E1E4A43584B848C2FC11E04D77
-A0ED2032C5249EE1A653F1F88005D9E779E385DF533B5C521137CEE5176CD7FC
-A104B1314DF8E02F7DE27DDC287D0961D6E6824AD4DAFC3D11064F24C1B653D5
-A4328E058C867AF9CA8D468C388B72C250CE84BDB6BAF7F8C47C9A0B1CB35EEC
-A496E23AC0CAB8155FC9B117B97EAE368EFCBB9041AEC8804D5A308D2D01C2D8
-A4B72DBD37256324B557B9176F8CBA4310DDFFBCC4609977E2463F3504A716C8
-A61FE79B019062DD3C6420BC20EAF64702CC1063C546A084DD0A0BCB915A14A9
-A686FEE577C88AB664D0787ECDFFF035F4806F3DE418DC9E4D516324FFF02083
-A90132CEA1D4F7185E4F688EFFD16F6AC14DFD78356A807599A5DABBEEF3333E
-AB7292F82267333031F512379FDBADA949DFA49D3C046CC8FA7F34117C342986
-B7121039CAF13E03E52507F42DB56FA802FF119DA7591ABA8A2E842133DB7C9C
-B75104427B6A5BE55033AF50DC0FE3102181BE130E761D487A4E8178C93317DD
-B8686723E415534BC0DBD16326F9486F85B0B0799BF6639334E61DAAE67F36CD
-C0D1F42B9F4BF7ACC045B7BB5D4805E10737F67B6310CE505248D543D0D5FE07
-C5F1531C6331659C75A6411A088A65DAD7518FD91F57B64537A651B6DCD76AE0
-C65CBC98295549BA940494A6214B9706E7115E64F3FE269412C5B48AEACB2222
-C93F7B1EEF27CFD0F227DFE3F057D63833533890B7230B1821A424BD40848E33
-CB6E15165AC802E9B3F993F16C25D41F4E81C21EBDE71AE1B012AC00BF9C7C3F
-CD740652E552D93EE64D7C9D1CC25228E466895889CEE25A11C962AB09906978
-D0156949F1381943442C6974E9B5B49EF441BB799EF20477B90A89C3F33620CE
-D151962D954970501C60079258EBCFA38502E0A9F03CD640322B08C0A3117FE5
-D24566BF315F4E597D6E381C87119FB4198F5E9E2607F5F4AB362EF7E2E7672F
-D3A936E1A7775A45217C8296A1F22AC5631DCDEC45594099E78EEEBBEDCBA967
-D6CEAE5D9E047FAF7D797858D229AC991AD44316D1E2A37A21926D763153593A
-D8A50FA0068E9558E6C3BEE18CDB03B7EECBC3C56C1B2336B98AEE11644994B8
-DF21016B00FC54F9FE3BC8B039911BB216E9162FAD2FD14D990AB96E951B49BE
-E0E740E4B0F8B3548181FF75B5372FAF4C70B99EC995D694ED0FB91B03FF8D21
-E7568FE6E12331F4FD7DE61DA4C7559D0F8EB192A218D4741A3BA75184333838
-EC30C9C3065A06BB07DC5B1C6B497F370C1CA65C0F30C08E042BA6BCECC78F2C
-EF34030C01B13BF42B534072DCC3C75B13C009DC9241119ADA39E2C15E2AFD2E
-F5B6F88F75D391A4B1EB336F9E201239FB6B1377DB8CFA7B84736216E5AFFFD7
-FBB12938ABD86C125796EDF4162D291028890A7D6C0C1CCA75FD4B95EBFA7A1A
-FC02FD48DB92D4DCE6F11679D38354CF750CFC7F584A520EB90BDE80E241F2BD
-FD9D5C2DBBD4995AB69B8D50C439D9527B00529199C2FD01B2174EB58F07021F
-FDEDB5BDFCB67411513A61AEE5CB5B5D7C52AF06028EFC996CC1B05B1D6CEA2B
-ORACLE_BLOCKED_CERTS
-}
-
 # The 16 compromised certificates (8 intermediate keys, each issued by emSign and
 # cross-signed by Sectigo), by certificate SHA-256, from the disclosure site's
-# impacted-intermediates.json. A JDK is fixed when its blocklist has all 16,
-# whatever else its vendor's list contains (patched Corretto, Zulu, Oracle 8u511).
+# impacted-intermediates.json. Used only to describe a JDK's blocked.certs (did
+# the Oct 21 fix land?); since Oracle's Oct 24 update it no longer decides.
 EMUDHRA_COUNT=16
 emudhra_fingerprints() {
 cat <<'EMUDHRA_FPS'
@@ -242,25 +134,24 @@ EMUDHRA_FPS
 ROLE=""             # fleet (root orchestrator) | userpass | dev
 MODE=""             # audit | remediate | interactive
 VERBOSE=0; DEEP=0; EA=0; COLOR=1; YES=0
-FAIL_ON_EXPOSED=1; RUN_RECON=0; USER_SCOPE=all; PASS_LABEL=""; BC_FAILED_PRESET=0
-REMOVE_ROOTS=0; ALLOW_DESTRUCTIVE=0
-BLOCKED_CERTS_URL="${BLOCKED_CERTS_URL:-}"
-BLOCKED_CERTS_SHA256="${BLOCKED_CERTS_SHA256:-}"
-BLOCKED_CERTS_FILE="${BLOCKED_CERTS_FILE:-}"
+FAIL_ON_EXPOSED=1; RUN_RECON=0; USER_SCOPE=all; PASS_LABEL=""
+ALLOW_DESTRUCTIVE=0
 
 yesno() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in 1|y|yes|true|on) echo 1 ;; *) echo 0 ;; esac; }
 
-if [ "$(id -u)" -eq 0 ] && [ $# -ge 3 ] && [ "${1#-}" = "$1" ]; then
+# Sourced (tests, other tools): load the functions only; never parse the
+# caller's arguments or start a pass.
+EMSIGN_SOURCED=0; [ "${BASH_SOURCE[0]}" != "$0" ] && EMSIGN_SOURCED=1
+if [ $EMSIGN_SOURCED -eq 1 ]; then
+  ROLE=dev
+elif [ "$(id -u)" -eq 0 ] && [ $# -ge 3 ] && [ "${1#-}" = "$1" ]; then
   # Jamf positional parameters ($1-$3 are mount point, computer, user)
   ROLE=fleet
   MODE="${4:-audit}"
-  [ -n "${5:-}" ] && BLOCKED_CERTS_URL="$5"
-  [ -n "${6:-}" ] && BLOCKED_CERTS_SHA256="$6"
-  if [ -n "${7:-}" ]; then VERBOSE=$(yesno "$7"); else VERBOSE=1; fi
-  [ -n "${8:-}" ] && FAIL_ON_EXPOSED=$(yesno "$8")
-  [ -n "${9:-}" ] && RUN_RECON=$(yesno "$9")
-  [ -n "${10:-}" ] && USER_SCOPE="${10}"
-  [ -n "${11:-}" ] && REMOVE_ROOTS=$(yesno "${11}")
+  if [ -n "${5:-}" ]; then VERBOSE=$(yesno "$5"); else VERBOSE=1; fi
+  [ -n "${6:-}" ] && FAIL_ON_EXPOSED=$(yesno "$6")
+  [ -n "${7:-}" ] && RUN_RECON=$(yesno "$7")
+  [ -n "${8:-}" ] && USER_SCOPE="$8"
 else
   for a in "$@"; do
     case "$a" in
@@ -275,14 +166,8 @@ else
       --no-color) COLOR=0 ;;
       --verbose) VERBOSE=1 ;;
       --quiet) VERBOSE=0 ;;
-      --blocked-url=*) BLOCKED_CERTS_URL="${a#--blocked-url=}" ;;
-      --blocked-sha256=*) BLOCKED_CERTS_SHA256="${a#--blocked-sha256=}" ;;
-      --blocked-file=*) BLOCKED_CERTS_FILE="${a#--blocked-file=}" ;;
-      --blocked-label=*) BLOCKED_CERTS_LABEL="${a#--blocked-label=}" ;;
-      --blocked-unavailable) BC_FAILED_PRESET=1 ;;
       --fail-on-exposed=*) FAIL_ON_EXPOSED=$(yesno "${a#*=}") ;;
       --recon) RUN_RECON=1 ;;
-      --remove-roots) REMOVE_ROOTS=1 ;;
       --allow-destructive) ALLOW_DESTRUCTIVE=1 ;;
       --users=*) USER_SCOPE="${a#--users=}" ;;
       -h|--help) sed -n '2,100p' "$0" | sed -n '/^#/p' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -390,9 +275,16 @@ timed() {   # timed LABEL cmd... -> runs a section and logs its duration at DEBU
 #   COMPROMISED  one of the 8 compromised intermediate keys (either issuer)
 #   SUSPECT      affected-looking name with an unrecognized key -> review
 ANCHOR_KEYS="8D417DB2DD8BF5E3084D1E3F196D583849D81BDD4C00C70B9D39369E96B8C782 C619E4780ED8E0ABEDA24AD732567DE4383A7EA941338F6D1A7D1B49AC792FE9 0A6C2B2CA5B364207954171987AC9D2178561569D8205457E77CA90C32EDE282 BD153ED7B0434F6886B17BCE8BBE84ED340C7132D702A8F4FA318F756ECBD6F3"
-# emSign ECC Root CA - G3, emSign Root TLS CA - G3, emSign Root CS CA - G3.
-# Only these may ever be removed from a JDK store; AAA Certificate Services never.
-EMSIGN_ROOT_KEYS="8D417DB2DD8BF5E3084D1E3F196D583849D81BDD4C00C70B9D39369E96B8C782 C619E4780ED8E0ABEDA24AD732567DE4383A7EA941338F6D1A7D1B49AC792FE9 0A6C2B2CA5B364207954171987AC9D2178561569D8205457E77CA90C32EDE282"
+# Java trust stores: the four roots Oracle/OpenJDK removed from cacerts on
+# 2026-10-24 (CVE-2026-114820, JDK-8395690), by SPKI SHA-256 (keys checked
+# against OpenJDK's cacerts sources): emsigneccrootcag3, emsignrootcag1,
+# emsignrootcag2, comodoaaaca. Plus emSign Root TLS/CS CA - G3, which no JDK
+# ships but which would be just as bad in a Java store. Only trusted entries
+# with these keys are ever removed; a same-named entry with another key is
+# reported for review, never deleted.
+JDK_DISTRUST_KEYS="8D417DB2DD8BF5E3084D1E3F196D583849D81BDD4C00C70B9D39369E96B8C782 376A1A7082A593DCCC20D561D119E9AB8D30F11CC321D0A37FA41F0DF284E01C 71F8ADEEC2B58ADBDF6205C98DDE928A4254B03695193D7F9A63A9A2588095D0 BD153ED7B0434F6886B17BCE8BBE84ED340C7132D702A8F4FA318F756ECBD6F3 C619E4780ED8E0ABEDA24AD732567DE4383A7EA941338F6D1A7D1B49AC792FE9 0A6C2B2CA5B364207954171987AC9D2178561569D8205457E77CA90C32EDE282"
+JDK_DISTRUST_ALIAS_RE='emsigneccrootcag3|emsignrootcag1|emsignrootcag2|comodoaaaca'
+JDK_FIXED_BUILDS="8u511-b33, 11.0.33.0.3, 17.0.21.0.3, 21.0.13.0.3, 25.0.5.0.3, 27.0.1.0.3 (or a vendor build with JDK-8395690)"
 COMPROMISED_KEYS="EBED6475C2C2D80FCB199F3FE8DD6E6B3CE60B77EB15D4E42C3DEC0C6F5B5105 43BFFA19D6EF651451F6841E019931E96F6F2EAEFF28AB4B6F1CE4576DE2717B E0254C7FCDC265E2F0F8A428DABB75AB4AE039B4872D62F5EE57F0877D5A8A41 49DD353DC2B919A3770645117D0E60C16115E7D1BC259EEFE734B00EA434FE5F 63ECEFEE431D49523BC1136C4E72D0206A477086CAF606CD5CF025686C109CF8 5C0660A2B164910D8FF589C18E14552E9E0EC237DCEFE2CB736D41A4811F81A0 EC4FFA1AD0AC88081314B7AAFFEF6A91F97CD57291BB5BA686C5415F5EB4F6B6 92C063D67E8F14DB71D288E11266FFDAF69CBF115F7BAB14F3BC2F68D25E0E30"
 SUSPECT_RE='CN *= *(emSign (ECC Root CA|Root TLS CA|Root CS CA) - G3|AAA Certificate Services|EM (DV|OV|EV) (TLS|CS) CA - G3[BC])'
 if [ -x /usr/bin/openssl ]; then OPENSSL=/usr/bin/openssl; else OPENSSL=$(command -v openssl 2>/dev/null || echo openssl); fi
@@ -510,13 +402,16 @@ LAST_BUNDLE_CLEAN=0; LAST_BUNDLE_AFFECTED=0
 # Each file is judged once per pass: the cache key is the real path, and a file
 # with identical contents at another path is reported as a note, not recounted.
 check_bundle() {
-  local f="$1" label="$2" sev="${3:-fail}" fix="${4:-}" canon h hit rows rc total hits sus names
+  local f="$1" label="$2" sev="${3:-fail}" fix="${4:-}" canon h hit rows rc total hits sus names rank
   LAST_BUNDLE_CLEAN=0; LAST_BUNDLE_AFFECTED=0
+  case "$sev" in note) rank=0 ;; pend) rank=1 ;; *) rank=2 ;; esac
   if [ ! -f "$f" ] || [ ! -r "$f" ]; then
     unv "$label: not a readable file: $f" "Fix the path or permissions, or remove the setting that points to it"; return
   fi
   canon=$(rp "$f"); h=$(sha256_of "$canon")
-  hit=$(printf '%s\n' "$BUNDLE_CACHE" | awk -F'\t' -v p="$canon" -v h="$h" '$1 == p || ($2 == h && h != "") { print $1 "\t" $3 "\t" $4; exit }')
+  # Same contents (any path) = same verdict. A file that changed is judged again,
+  # and a stronger context (fail > pend > note) is reported, never hidden by a weaker one.
+  hit=$(printf '%s\n' "$BUNDLE_CACHE" | awk -F'\t' -v h="$h" -v r="$rank" 'h != "" && $2 == h && ($3 == 0 || $5 >= r) { print $1 "\t" $3 "\t" $4; exit }')
   if [ -n "$hit" ]; then
     LAST_BUNDLE_AFFECTED=$(printf '%s' "$hit" | cut -f2); LAST_BUNDLE_CLEAN=$(printf '%s' "$hit" | cut -f3)
     if [ "$(printf '%s' "$hit" | cut -f1)" = "$canon" ]; then dbg "$label: $canon already judged (affected=$LAST_BUNDLE_AFFECTED)"
@@ -547,7 +442,7 @@ check_bundle() {
     LAST_BUNDLE_CLEAN=1
     ok "$label: $canon ($total certs, no affected keys)"
   fi
-  BUNDLE_CACHE="$BUNDLE_CACHE"$'\n'"$canon"$'\t'"$h"$'\t'"$LAST_BUNDLE_AFFECTED"$'\t'"$LAST_BUNDLE_CLEAN"
+  BUNDLE_CACHE="$BUNDLE_CACHE"$'\n'"$canon"$'\t'"$h"$'\t'"$LAST_BUNDLE_AFFECTED"$'\t'"$LAST_BUNDLE_CLEAN"$'\t'"$rank"
 }
 
 # check_cert_dir DIR LABEL -> same verdict for an OpenSSL hashed CA directory
@@ -557,6 +452,7 @@ check_cert_dir() {
     unv "$label: directory not readable: $d" "Fix the path or permissions"; return
   fi
   for c in "$d"/*; do
+    if [ -L "$c" ] && [ ! -e "$c" ]; then n=$((n+1)); bad=$((bad+1)); dbg "$label: broken link $c"; continue; fi
     [ -f "$c" ] || continue
     case "${c##*/}" in *.r[0-9]*) continue ;; esac   # CRLs, not certificates
     n=$((n+1))
@@ -567,7 +463,7 @@ check_cert_dir() {
   names=$(printf '%s\n' "$all" | affected_names)
   dbg "$label: $d -> files=$n unparsable=$bad affected=$hits suspect=$sus"
   if [ "$hits" -gt 0 ]; then fail "$label: $d trusts $names" "Remove those files from the directory (or update its owning package) and re-hash it"
-  elif [ $bad -gt 0 ]; then unv "$label: $bad of $n files in $d could not be parsed; no verdict" "Regenerate the directory with its owning package"
+  elif [ $bad -gt 0 ]; then unv "$label: $bad of $n entries in $d are broken links or could not be parsed; no verdict" "Regenerate the directory with its owning package"
   elif [ $n -eq 0 ]; then unv "$label: $d has no certificate files" "Point the setting at the directory actually in use"
   elif [ "$sus" -gt 0 ]; then unv "$label: $d has affected-looking names with unrecognized keys: $names" "Compare their fingerprints with the disclosure site"
   else ok "$label: $d ($n certs, no affected keys)"; fi
@@ -613,51 +509,46 @@ ks_scan() {
   rm -rf "$d"
 }
 
-# check_keystore KEYTOOL STORE PASSWORD LABEL [JDK_HOME]
-# For a JDK, cacerts contents are not the verdict (blocked.certs is): patched
-# vendor JDKs keep the roots. LAST_KS_ALIAS lists emSign root aliases by key, for
-# the opt-in root removal. A custom store is only as safe as the JVMs using it.
+# ks_roots ROWS -> aliases of trusted entries whose key is one of JDK_DISTRUST_KEYS
+ks_roots() {
+  printf '%s\n' "$1" | awk -F'\t' -v k=" $JDK_DISTRUST_KEYS " '$2 == "trustedCertEntry" && index(k, " " $4 " ") { print $1 }' | sort -u | paste -sd';' -
+}
+
+# check_keystore KEYTOOL STORE PASSWORD LABEL [jdk|custom]
+# Lists the store and sets KS_STATE: OK (listed and parsed), SEEN (already judged
+# this pass), BAD (no verdict, already reported); KS_ROOTS = distrusted root
+# aliases (by key); KS_TOTAL = entries. A JDK's own cacerts is judged by
+# audit_java; a custom store is judged here: it is exposed if it trusts any of
+# those roots or a compromised intermediate.
 check_keystore() {
-  local kt="$1" ks="$2" pw="$3" label="$4" jh="${5:-}" rows total roots comp anchors
-  LAST_KS_ALIAS=""
+  local kt="$1" ks="$2" pw="$3" label="$4" kind="${5:-custom}" rows comp odd
+  KS_STATE=BAD; KS_ROOTS=""; KS_TOTAL=0
   [ -r "$ks" ] || { unv "$label: keystore not readable: $ks" "Fix permissions or the configured path"; return; }
   ks=$(rp "$ks")
-  if seen "ks:$ks"; then dbg "$label: $ks already checked"; return; fi
+  if seen "ks:$ks"; then dbg "$label: $ks already checked"; KS_STATE=SEEN; return; fi
   rows=$(ks_scan "$kt" "$ks" "$pw")
   KS_RC=$(printf '%s\n' "$rows" | awk -F'\t' '$1 == "@@RC" { print $2; exit }')
   rows=$(printf '%s\n' "$rows" | grep -v '^@@RC')
-  total=$(printf '%s\n' "$rows" | grep -c .)
-  roots=$(printf '%s\n' "$rows" | awk -F'\t' -v k=" $EMSIGN_ROOT_KEYS " '$2 == "trustedCertEntry" && index(k, " " $4 " ") { print $1 }' | sort -u | paste -sd';' -)
-  anchors=$(printf '%s\n' "$rows" | awk -F'\t' '$2 == "trustedCertEntry" && $5 == "ANCHOR" { print $1 }' | sort -u | paste -sd';' -)
-  comp=$(printf '%s\n' "$rows" | awk -F'\t' '$5 == "COMPROMISED" { print $1 }' | sort -u | paste -sd';' -)
-  dbg "$label: keytool rc=$KS_RC certs=$total emsign_roots=${roots:-none} anchors=${anchors:-none} compromised=${comp:-none}"
-  if [ "$total" -eq 0 ]; then unv "$label: could not read $ks (keytool rc=$KS_RC)" "Check the store password or format"; return; fi
+  KS_TOTAL=$(printf '%s\n' "$rows" | grep -c .)
+  # keytool rc 0 with no entries is an empty store (trusts nothing), not a read failure.
+  if [ "$KS_TOTAL" -eq 0 ] && [ "${KS_RC:-1}" != 0 ]; then unv "$label: could not read $ks (keytool rc=$KS_RC)" "Check the store password or format"; return; fi
   if printf '%s\n' "$rows" | grep -q $'\tUNPARSABLE\t'; then
-    unv "$label: some entries in $ks could not be parsed" "Inspect the store with keytool -list -v"
+    unv "$label: some entries in $ks could not be parsed; no verdict" "Inspect the store with keytool -list -v"; return
   fi
-  if [ -n "$jh" ]; then
-    if [ -n "$roots" ]; then
-      if [ "${JDK_BL_OK:-0}" -eq 1 ]; then
-        info "$label: emSign root(s) still in cacerts (${roots//;/, }); expected on patched JDKs, blocked.certs stops the compromised chains"
-      else
-        info "$label: emSign root(s) in cacerts (${roots//;/, }); the blocked.certs merge is the fix$([ $REMOVE_ROOTS -eq 1 ] && echo '; root removal enabled' || echo ' (root removal is opt-in: --remove-roots / $11)')"
-        LAST_KS_ALIAS="$roots"
-      fi
-    else ok "$label: $ks ($total certs, no emSign root)"; fi
-    return
-  fi
-  if [ -n "$comp" ]; then
-    fail "$label: custom trust store $ks contains compromised intermediate(s) as trusted entries (${comp//;/, })" \
-         "Delete those aliases with keytool -delete; they are never needed"
-  elif [ -n "$anchors" ]; then
-    warn "$label: custom trust store $ks contains affected root(s) (${anchors//;/, }); safe only on JVMs whose blocked.certs is complete"
-    MANUAL+=("Custom trust store $ks: confirm every JVM using it is patched, or remove alias(es) ${anchors//;/, }")
-  else ok "$label: $ks ($total certs, no affected keys)"; fi
-}
-
-# ks_emsign_roots KEYTOOL STORE -> emSign root aliases (by key) still present
-ks_emsign_roots() {
-  ks_scan "$1" "$2" changeit | awk -F'\t' -v k=" $EMSIGN_ROOT_KEYS " '$2 == "trustedCertEntry" && index(k, " " $4 " ") { print $1 }' | sort -u | paste -sd';' -
+  KS_ROOTS=$(ks_roots "$rows")
+  comp=$(printf '%s\n' "$rows" | awk -F'\t' '$5 == "COMPROMISED" { print $1 }' | sort -u | paste -sd';' -)
+  # A distrusted alias name or an affected-looking subject on an unknown key: review, never delete.
+  odd=$(printf '%s\n' "$rows" | awk -F'\t' -v k=" $JDK_DISTRUST_KEYS " -v re="$JDK_DISTRUST_ALIAS_RE" \
+          '!index(k, " " $4 " ") && ($5 == "SUSPECT" || $1 ~ re) { print $1 }' | sort -u | paste -sd';' -)
+  dbg "$label: keytool rc=$KS_RC entries=$KS_TOTAL distrusted_roots=${KS_ROOTS:-none} compromised=${comp:-none} odd=${odd:-none}"
+  KS_STATE=OK
+  [ -n "$odd" ] && unv "$label: $ks has entries named like the distrusted roots but with unrecognized keys (${odd//;/, })" \
+                       "Compare their fingerprints with the disclosure site; this script will not delete them by name"
+  [ "$kind" = jdk ] && return 0
+  if [ -n "$KS_ROOTS$comp" ]; then
+    fail "$label: custom trust store $ks trusts ${KS_ROOTS:+distrusted root(s) ${KS_ROOTS//;/, }}${KS_ROOTS:+${comp:+ and }}${comp:+compromised intermediate(s) ${comp//;/, }}" \
+         "Delete those aliases: keytool -delete -keystore '$ks' -alias '<alias>' (Oracle removed the same roots from the JDK on Oct 24)"
+  elif [ -z "$odd" ]; then ok "$label: $ks ($KS_TOTAL certs, none of the distrusted roots or keys)"; fi
 }
 
 queue_brew() { case " $BREW_PKGS " in *" $1 "*) ;; *) BREW_PKGS="${BREW_PKGS:+$BREW_PKGS }$1" ;; esac; }
@@ -752,9 +643,6 @@ audit_node() {
     [ -z "$ver" ] && ver=$(printf '%s' "$nb" | grep -o 'v[0-9][0-9]*\.[0-9][0-9.]*' | head -1)
     v=${ver#v}
     dbg "node candidate $nb -> $r version=${ver:-unknown}"
-    if [ "$ROLE" = dev ] && [ -n "${NODE_OPTIONS:-}" ] && ! ( cd / && run_t 20 "$nb" --version ) >/dev/null 2>&1 </dev/null; then
-      warn "node $ver ($nb): fails to start with your NODE_OPTIONS ($NODE_OPTIONS)"
-    fi
     case "${v%%.*}" in
       22) need=22.23.4 ;; 24) need=24.22.1 ;; 26) need=26.12.1 ;;
       *) if [ -n "$v" ] && ver_ge "$v" 27; then need=""; else need="EOL"; fi ;;
@@ -808,7 +696,7 @@ audit_node() {
 
 audit_java() {
   hdr "Java"
-  local jhomes jh r jv ks bc needbc miss found=0 anykt="" o ts pw tt gp gjh ide
+  local jhomes jh r jv ks bc miss bln found=0 anykt="" o ts pw tt gp gjh ide
   gp="$HOME/.gradle/gradle.properties"
   gjh=""; is_user_pass && gjh=$(props_value "$gp" org.gradle.java.home)
   [ -n "$gjh" ] && dbg "Gradle org.gradle.java.home=$gjh"
@@ -834,29 +722,27 @@ audit_java() {
     ks="$jh/lib/security/cacerts"; [ -f "$ks" ] || ks="$jh/jre/lib/security/cacerts"
     bc=$(jdk_blocklist_path "$jh")
     ide=0; case "$jh" in /Applications/*.app/*|"$HOME"/Applications/*.app/*) ide=1 ;; esac
-    JDK_BL_OK=0; needbc=0
+    # blocked.certs is context only now: it tells whether the Oct 21 fix landed.
     miss=$(bl_missing "$bc")
-    dbg "JDK $jh: $bc -> ${miss} of $EMUDHRA_COUNT compromised certificates not blocked"
-    if [ "$miss" = "BADFORMAT" ]; then
-      unv "JDK [$jv] $jh: $(basename "$bc") is not in the standard SHA-256 format; no verdict" "Compare it with the JDK vendor's file, or reinstall the JDK"
-    elif [ "$miss" -eq 0 ]; then
-      JDK_BL_OK=1
-      ok "JDK [$jv] $jh: $(basename "$bc") blocks all $EMUDHRA_COUNT compromised certificates (both issuers)"
+    case "$miss" in
+      0) bln="has the Oct 21 blocklist" ;;
+      BADFORMAT) bln="$(basename "$bc") not in the standard format" ;;
+      "$EMUDHRA_COUNT") bln="no eMudhra blocklist" ;;
+      *) bln="blocklist missing $miss of $EMUDHRA_COUNT" ;;
+    esac
+    dbg "JDK $jh: $bc -> $bln"
+    check_keystore "$jh/bin/keytool" "$ks" changeit "JDK [$jv] $jh" jdk
+    case "$KS_STATE" in SEEN|BAD) continue ;; esac
+    if [ -z "$KS_ROOTS" ]; then
+      ok "JDK [$jv] $jh: cacerts trusts none of the 4 roots Oracle removed on Oct 24 ($bln)"
     elif [ $ide -eq 1 ]; then
-      pend "JDK [$jv] $jh: IDE-bundled runtime does not block $miss of $EMUDHRA_COUNT compromised certificates; not edited (signed app)" \
+      pend "JDK [$jv] $jh: IDE-bundled runtime still trusts ${KS_ROOTS//;/, }; not edited (signed app)" \
            "Set the IDE's Gradle JVM to a fixed JDK; update the IDE when its vendor ships a new runtime"
     else
-      needbc=1
-      fail "JDK [$jv] $jh: $(basename "$bc") does not block $miss of $EMUDHRA_COUNT compromised certificates" \
-           "Install a fixed JDK (Oracle/OpenJDK 8u511, 11.0.33.0.2, 17.0.21.0.2, 21.0.13.0.2, 25.0.5.0.2, 27.0.1.0.2; Corretto 21.0.13.0.10), or let this script merge Oracle's blocklist"
+      fail "JDK [$jv] $jh: cacerts still trusts ${KS_ROOTS//;/, } ($bln; Oracle now lists blocklist-only builds as affected)" \
+           "Install a fixed JDK ($JDK_FIXED_BUILDS), or remove those roots from cacerts (this script does it in remediate mode, with a backup)"
+      JDK_FIX+=("$jh|$ks|$KS_ROOTS")
     fi
-    if [ $ide -eq 1 ] && [ $JDK_BL_OK -eq 0 ]; then
-      dbg "IDE runtime $jh already reported; skipping cacerts detail"; continue
-    fi
-    check_keystore "$jh/bin/keytool" "$ks" changeit "JDK [$jv] $jh" "$jh"
-    [ $ide -eq 1 ] && continue
-    [ $REMOVE_ROOTS -eq 1 ] || LAST_KS_ALIAS=""
-    if [ -n "$LAST_KS_ALIAS" ] || [ $needbc -eq 1 ]; then JDK_FIX+=("$jh|$ks|$LAST_KS_ALIAS|$needbc|$bc"); fi
   done
   [ $found -eq 0 ] && info "no JDKs found"
   if [ -n "$gjh" ] && [ ! -x "$gjh/bin/keytool" ]; then
@@ -865,6 +751,9 @@ audit_java() {
 
   is_user_pass || return 0
   for o in "${JAVA_TOOL_OPTIONS:-}" "${JDK_JAVA_OPTIONS:-}"; do
+    case "$o" in *com.sun.net.ssl.checkRevocation=true*com.sun.security.enableCRLDP=true*|*com.sun.security.enableCRLDP=true*com.sun.net.ssl.checkRevocation=true*)
+      info "revocation checking is on for JVMs that inherit these options (Oracle's alternative mitigation); not counted, other launches do not get it" ;;
+    esac
     ts=$(printf '%s' "$o" | grep -o 'javax.net.ssl.trustStore=[^ ]*' | cut -d= -f2)
     pw=$(printf '%s' "$o" | grep -o 'javax.net.ssl.trustStorePassword=[^ ]*' | cut -d= -f2)
     [ -n "$ts" ] && [ -n "$anykt" ] && check_keystore "$anykt" "$ts" "$pw" "JVM options trustStore"
@@ -959,8 +848,13 @@ audit_go() {
     r=$(rp "$g"); seen "go:$r" && continue
     mine "$g" || continue
     found=1
-    gv=$(probe_go 20 "$g" env GOVERSION 2>/dev/null); v=${gv#go}; v=${v%%[!0-9.]*}
+    gv=$(probe_go 20 "$g" env GOVERSION 2>/dev/null); v=${gv#go}; v=${v%% *}
     dbg "go $g -> $r version=$gv"
+    # Release versions only: a prerelease (go1.27.3rc1) or devel build may predate the fix.
+    if ! printf '%s' "$v" | grep -Eq '^1\.[0-9]+(\.[0-9]+)?$'; then
+      unv "Go ${gv:-unknown} ($g): not a release version; cannot tell whether it has the key block" "Install a Go release (1.26.10 / 1.27.3 or later)"
+      continue
+    fi
     mm=$(echo "$v" | cut -d. -f1,2)
     case "$mm" in
       1.26) need=1.26.10 ;; 1.27) need=1.27.3 ;;
@@ -992,7 +886,7 @@ audit_go_bins() {
     # `go version FILE` reads build metadata; the binary itself is never executed.
     if [ -n "$tool" ]; then v=$(probe_go 15 "$tool" version "$f" 2>/dev/null | awk '{print $2}')
     else v=$(LC_ALL=C grep -a -o -m1 'go1\.[0-9][0-9]*\.[0-9][0-9]*' "$f" 2>/dev/null | head -1); fi
-    case "$v" in go1.*) ;; *) dbg "go binary $f: build version unknown"; continue ;; esac
+    case "$v" in go1.*) ;; *) warn "Go binary $f: build version unreadable; rebuild it with Go >= 1.26.10 if it ships to Linux/containers"; continue ;; esac
     n=$((n+1)); v=${v#go}; mm=$(echo "$v" | cut -d. -f1,2)
     case "$mm" in 1.26) need=1.26.10 ;; 1.27) need=1.27.3 ;; *) if ver_ge "$v" 1.28; then need=""; else need=1.26.10; fi ;; esac
     if [ -n "$need" ] && ! ver_ge "$v" "$need"; then
@@ -1064,7 +958,7 @@ audit_deep() {
 run_audit() {
   PASS=0; WARN=0; FAIL=0; PEND=0; UNV=0; SEEN=""; BUNDLE_CACHE=""; RESULTS=(); NOT_COVERED=()
   NODE_FIX=(); JDK_FIX=(); CERTIFI_FIX=(); PIP_FIX=(); UV_FIX=(); BREW_PKGS=""; MANUAL=()
-  LAST_KS_ALIAS=""
+  KS_ROOTS=""
   is_system_pass && timed "macos" audit_macos
   is_user_pass   && timed "env" audit_env
   timed "node"   audit_node
@@ -1088,93 +982,10 @@ pass_status() {
   elif [ $PEND -gt 0 ]; then echo VENDOR_PENDING
   else echo PROTECTED; fi
 }
+# Developer result: errors mean not proven unless something is already exposed.
+dev_status() { local st; st=$(pass_status); [ "${ERRORS:-0}" -gt 0 ] && [ "$st" != EXPOSED ] && st=UNVERIFIED; echo "$st"; }
+status_rc() { case "$1" in EXPOSED) echo 2 ;; UNVERIFIED) echo 3 ;; VENDOR_PENDING) echo 1 ;; *) echo 0 ;; esac; }
 counts() { echo "pass=$PASS fail=$FAIL pending=$PEND unverified=$UNV advisory=$WARN"; }
-
-# =============================================================================
-# blocked.certs acquisition
-# =============================================================================
-FETCH_ERR=""
-# A browser on macOS uses the keychain and the system/PAC proxy; curl uses
-# neither. Retry with admin-installed keychain roots and the scutil proxy.
-fetch_url() {   # fetch_url URL OUT
-  local url="$1" out="$2" rc e bundle="" px="" opts=""
-  dbg "fetching $url"
-  e=$(curl -fsSL --max-time 30 -o "$out" "$url" 2>&1); rc=$?
-  dbg "curl rc=$rc ${e:+($e)}"
-  [ $rc -eq 0 ] && return 0
-  FETCH_ERR="curl exit $rc: ${e:-no detail}"
-  if [ $rc -eq 22 ] && printf '%s' "$e" | grep -q ' 403'; then
-    FETCH_ERR="$FETCH_ERR | server rejects scripted downloads; host the file internally for \$5"
-    return 1
-  fi
-  if [ "$(uname)" = Darwin ]; then
-    if [ $rc -eq 60 ] || [ $rc -eq 35 ] || [ $rc -eq 77 ]; then
-      bundle=$(mktemp "${TMPDIR:-/tmp}/kc-roots.XXXXXX")
-      { cat /etc/ssl/cert.pem 2>/dev/null
-        security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null; } > "$bundle"
-      opts="--cacert $bundle"
-    fi
-    if [ -z "${https_proxy:-}${HTTPS_PROXY:-}" ]; then
-      px=$(scutil --proxy 2>/dev/null | awk '/HTTPSEnable : 1/{on=1} /HTTPSProxy :/{h=$3} /HTTPSPort :/{p=$3} END{if(on&&h)print h":"p}')
-      [ -n "$px" ] && opts="$opts --proxy http://$px"
-    fi
-    if [ -n "$opts" ]; then
-      dbg "retrying with:$opts"
-      # shellcheck disable=SC2086
-      e=$(curl -fsSL --max-time 30 $opts -o "$out" "$url" 2>&1); rc=$?
-      [ -n "$bundle" ] && rm -f "$bundle"
-      [ $rc -eq 0 ] && { dbg "downloaded using${px:+ system proxy $px}${bundle:+ keychain-installed CAs}"; return 0; }
-      FETCH_ERR="$FETCH_ERR | retry: curl exit $rc: ${e:-no detail}"
-    fi
-    scutil --proxy 2>/dev/null | grep -q 'ProxyAutoConfigEnable : 1' && \
-      FETCH_ERR="$FETCH_ERR | this Mac uses a PAC proxy file, which curl cannot read"
-  fi
-  return 1
-}
-
-BCNEW=""; BC_FAILED=$BC_FAILED_PRESET; BC_SRC=""; BC_SHA=""; BC_LABEL=""; BC_COUNT=0; BLOCKED_CERTS_LABEL="${BLOCKED_CERTS_LABEL:-}"
-get_blocked() {   # load the reference blocklist once per process -> $BCNEW
-  [ -n "$BCNEW" ] && return 0
-  if [ $BC_FAILED -eq 1 ]; then dbg "blocked.certs unavailable for this run (see earlier error)"; return 1; fi
-  local src="" got
-  BCNEW=$(mktemp "${TMPDIR:-/tmp}/blocked.certs.XXXXXX") || { BC_FAILED=1; return 1; }
-  # Optional override (a newer Oracle list): needs a SHA-256 pin outside dev mode.
-  if [ -n "$BLOCKED_CERTS_FILE$BLOCKED_CERTS_URL" ]; then
-    if [ -z "$BLOCKED_CERTS_SHA256" ]; then
-      err_ "blocked.certs override given without a SHA-256 pin (\$6 / BLOCKED_CERTS_SHA256); using the embedded list"
-    elif [ -n "$BLOCKED_CERTS_FILE" ]; then
-      dbg "blocked.certs override: file $BLOCKED_CERTS_FILE"
-      if cp "$BLOCKED_CERTS_FILE" "$BCNEW" 2>/dev/null; then src="$BLOCKED_CERTS_FILE"
-      else err_ "cannot read blocked.certs override $BLOCKED_CERTS_FILE; using the embedded list"; fi
-    elif fetch_url "$BLOCKED_CERTS_URL" "$BCNEW"; then src="$BLOCKED_CERTS_URL"
-    else
-      err_ "blocked.certs override download failed: $BLOCKED_CERTS_URL; using the embedded list"
-      line ERROR "  $FETCH_ERR"
-    fi
-    if [ -n "$src" ]; then
-      got=$(sha256_of "$BCNEW")
-      dbg "override sha256=$got expected=${BLOCKED_CERTS_SHA256:-<not pinned>}"
-      if [ -n "$BLOCKED_CERTS_SHA256" ] && [ "$got" != "$BLOCKED_CERTS_SHA256" ]; then
-        err_ "blocked.certs override $src: SHA-256 $got does not match the pin; using the embedded list"; src=""
-      elif ! head -1 "$BCNEW" | grep -q '^Algorithm='; then
-        err_ "blocked.certs override $src has no Algorithm= header; using the embedded list"; src=""
-      fi
-    fi
-  fi
-  if [ -z "$src" ]; then
-    embedded_blocklist > "$BCNEW"
-    got=$(sha256_of "$BCNEW")
-    if [ "$got" != "$EMBED_SHA" ]; then
-      err_ "embedded blocklist is corrupt (sha256 $got); this copy of the script was altered"
-      rm -f "$BCNEW"; BCNEW=""; BC_FAILED=1; return 1
-    fi
-    src="embedded"
-  fi
-  BC_SRC="$src"; BC_SHA="$got"; BC_LABEL="${BLOCKED_CERTS_LABEL:-$src}"
-  BC_COUNT=$(($(wc -l < "$BCNEW")-1))
-  dbg "reference blocklist: $BC_COUNT entries, sha256=$BC_SHA, source=$BC_SRC"
-  return 0
-}
 
 # bl_missing FILE -> how many of the 16 compromised certificates FILE does not
 # block, or BADFORMAT when it is not a clean "Algorithm=SHA-256" + hex list.
@@ -1201,6 +1012,7 @@ jdk_blocklist_path() {
     [ -f "$c" ] && { echo "$c"; return; }
   done
   if [ -d "$jh/jre/lib/security" ]; then echo "$jh/jre/lib/security/blacklisted.certs"
+  elif grep -q '^JAVA_VERSION="1\.8' "$jh/release" 2>/dev/null; then echo "$jh/lib/security/blacklisted.certs"
   else echo "$jh/lib/security/blocked.certs"; fi
 }
 
@@ -1213,7 +1025,7 @@ jdk_blocklist_path() {
 ask() {   # ask CATEGORY "question" -> 0 = go ahead
   local cat=$1 q=$2 r
   if [ "$ROLE" != dev ]; then
-    if [ "$MODE" = remediate ] && { [ "$cat" = java ] || { [ "$cat" = java-destructive ] && [ $REMOVE_ROOTS -eq 1 ]; }; }; then
+    if [ "$MODE" = remediate ] && [ "$cat" = java ]; then
       dbg "auto-approved ($cat): $q"; return 0
     fi
     dbg "not auto-approved ($cat): $q"; return 1
@@ -1232,82 +1044,84 @@ ask() {   # ask CATEGORY "question" -> 0 = go ahead
   case "$r" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-fix_java() {
-  hdr "Fix: Java"
-  local e jh ks alias needbc SUDO n_al al left bc merged hdrline stamp jdk_changed=0 miss
+# ks_remove_roots KEYTOOL STORE ALIASES STAMP [SUDO]
+# Transaction (pattern from the v2.3 suite): hash the live store, back it up and
+# verify the backup, delete the aliases on a staged copy in the same directory,
+# re-list the copy (no distrusted key left, nothing else lost), confirm the live
+# store did not change meanwhile, then rename the copy into place and re-hash.
+# The live store is untouched unless every check passes. Sets KS_TX_ERR / KS_TX_BACKUP.
+ks_remove_roots() {
+  local kt="$1" ks="$2" aliases="$3" stamp="$4" SUDO="${5:-}" dir h0 h1 bak stage al rows before after left
   local -a al_list
+  KS_TX_ERR=""; KS_TX_BACKUP=""
+  ks=$(rp "$ks"); dir=$(dirname "$ks")
+  h0=$(sha256_of "$ks"); [ -n "$h0" ] || { KS_TX_ERR="cannot hash $ks; nothing changed"; return 1; }
+  bak="$ks.emsign-bak-$stamp"
+  if ! $SUDO cp -p "$ks" "$bak" || [ "$(sha256_of "$bak")" != "$h0" ]; then
+    $SUDO rm -f "$bak"; KS_TX_ERR="backup of $ks failed or does not match; nothing changed"; return 1
+  fi
+  stage=$($SUDO mktemp "$dir/.cacerts.emsign.XXXXXX") || { KS_TX_ERR="cannot stage a copy in $dir; nothing changed (backup $bak)"; return 1; }
+  if ! $SUDO cp -p "$ks" "$stage"; then $SUDO rm -f "$stage"; KS_TX_ERR="cannot stage a copy in $dir; nothing changed (backup $bak)"; return 1; fi
+  before=$(ks_scan "$kt" "$stage" changeit | grep -v '^@@RC' | grep -c .)
+  # read -a: no pathname expansion ("[jdk]" is a glob and nullglob is on)
+  IFS=';' read -r -a al_list <<< "$aliases"
+  for al in "${al_list[@]}"; do
+    if ! $SUDO env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS "$kt" -delete -keystore "$stage" \
+         -storepass changeit -alias "$al" </dev/null >/dev/null 2>&1; then
+      $SUDO rm -f "$stage"; KS_TX_ERR="keytool could not delete '$al' from the staged copy; $ks unchanged (backup $bak)"; return 1
+    fi
+  done
+  rows=$(ks_scan "$kt" "$stage" changeit | grep -v '^@@RC')
+  after=$(printf '%s\n' "$rows" | grep -c .); left=$(ks_roots "$rows")
+  if [ -n "$left" ] || [ "$after" -ne $((before - ${#al_list[@]})) ] || printf '%s\n' "$rows" | grep -q $'\tUNPARSABLE\t'; then
+    $SUDO rm -f "$stage"
+    KS_TX_ERR="staged copy failed verification (still trusted: ${left:-none}; entries $before -> $after, expected $((before - ${#al_list[@]}))); $ks unchanged (backup $bak)"; return 1
+  fi
+  if [ "$(sha256_of "$ks")" != "$h0" ]; then
+    $SUDO rm -f "$stage"; KS_TX_ERR="$ks changed while the fix was staged (JDK update running?); not replaced (backup $bak)"; return 1
+  fi
+  h1=$(sha256_of "$stage")
+  if ! $SUDO mv -f "$stage" "$ks"; then $SUDO rm -f "$stage"; KS_TX_ERR="could not move the verified copy into place; $ks unchanged (backup $bak)"; return 1; fi
+  if [ "$(sha256_of "$ks")" != "$h1" ]; then KS_TX_ERR="$ks does not match the verified copy after the swap; restore with: cp -p '$bak' '$ks'"; return 1; fi
+  KS_TX_BACKUP="$bak"
+  dbg "root removal committed: $ks sha256 ${h0:0:12}… -> ${h1:0:12}…, entries $before -> $after, backup $bak"
+  return 0
+}
+
+fix_java() {
+  hdr "Fix: Java (remove the distrusted roots from cacerts)"
+  local e jh ks roots SUDO stamp n jdk_changed=0
   stamp=$(date +%Y%m%d%H%M%S)
   for e in "${JDK_FIX[@]}"; do
-    IFS='|' read -r jh ks alias needbc bc <<EOF
+    IFS='|' read -r jh ks roots <<EOF
 $e
 EOF
     say "JDK: $jh"
     SUDO=""
     if [ ! -w "$ks" ] || [ ! -w "$(dirname "$ks")" ]; then
       if [ "$ROLE" != dev ] || [ $YES -eq 1 ]; then
-        action "JDK $jh: $ks is not writable by $ME (owner $(owner_of "$ks")); fix as that account"; continue
+        action "JDK $jh: $ks is not writable by $ME (owner $(owner_of "$ks")); fix as that account or install a fixed JDK"; continue
       fi
       ask java "$ks is not writable by you. Use sudo?" || { skip_ "$jh"; continue; }
       SUDO="sudo"
     fi
-    if [ -n "$alias" ]; then
-      n_al=$(printf '%s' "$alias" | awk -F';' '{print NF}')
-      if ask java-destructive "Back up cacerts and delete $n_al emSign root alias(es), matched by key: ${alias//;/, }?"; then
-        if $SUDO cp -p "$ks" "$ks.bak-$stamp"; then
-          dbg "backed up $ks -> $ks.bak-$stamp"
-          # read -a: no pathname expansion ("[jdk]" is a glob and nullglob is on)
-          IFS=';' read -r -a al_list <<< "$alias"
-          for al in "${al_list[@]}"; do
-            if $SUDO env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS "$jh/bin/keytool" -delete -keystore "$ks" -storepass changeit -alias "$al" >/dev/null 2>&1 </dev/null; then
-              done_ "removed '$al' from $ks"; jdk_changed=1
-            else err_ "keytool could not delete '$al' from $ks"; fi
-          done
-          left=$(ks_emsign_roots "$jh/bin/keytool" "$ks")
-          if [ -n "$left" ]; then err_ "G3 alias(es) still present in $ks: ${left//;/, }"
-          else dbg "verified: no G3 aliases remain in $ks (backup $ks.bak-$stamp)"; fi
-        else err_ "could not back up $ks; nothing deleted"; fi
-      else
-        if [ "$ROLE" = dev ]; then skip_ "cacerts root removal"
-        else action "JDK $jh: delete G3 alias(es) ${alias//;/, } (run with \$4=remediate)"; fi
-      fi
-    fi
-
-    [ "$needbc" = "1" ] || continue
-    if ! ask java "Merge Oracle's blocklist ($BC_COUNT entries) into $bc?"; then
-      if [ "$ROLE" = dev ]; then skip_ "blocked.certs"
-      else action "JDK $jh: install Oracle blocked.certs (run with \$4=remediate)"; fi
+    n=$(printf '%s' "$roots" | awk -F';' '{print NF}')
+    if ! ask java "Remove $n distrusted root(s) from $ks (${roots//;/, }), as Oracle's Oct 24 builds do? A verified backup is kept."; then
+      if [ "$ROLE" = dev ]; then skip_ "cacerts root removal"
+      else action "JDK $jh: remove ${roots//;/, } from cacerts or install a fixed JDK (run with \$4=remediate)"; fi
       continue
     fi
-    if ! get_blocked; then
-      action "JDK $jh: merge Oracle blocked.certs (reference list unavailable this run; see errors)"; continue
+    if ks_remove_roots "$jh/bin/keytool" "$ks" "$roots" "$stamp" "$SUDO"; then
+      done_ "removed ${roots//;/, } from $ks (backup $KS_TX_BACKUP)"; jdk_changed=1
+    else
+      err_ "JDK $jh: $KS_TX_ERR"
     fi
-    merged=$(mktemp "${TMPDIR:-/tmp}/blocked.merged.XXXXXX")
-    hdrline=$(head -1 "$BCNEW")
-    if [ -f "$bc" ] && [ "$(head -1 "$bc")" != "$hdrline" ]; then
-      err_ "existing $bc uses a different algorithm header; install manually"; rm -f "$merged"; continue
-    fi
-    { echo "$hdrline"
-      { tail -n +2 "$BCNEW"; [ -f "$bc" ] && tail -n +2 "$bc"; } | grep -v '^[[:space:]]*$' | sort -u
-    } > "$merged"
-    dbg "merged blocked.certs for $jh: $(($(wc -l < "$merged")-1)) entries ($( [ -f "$bc" ] && echo $(($(wc -l < "$bc")-1)) || echo 0) existing)"
-    if { [ ! -f "$bc" ] || $SUDO cp -p "$bc" "$bc.bak-$stamp"; } && $SUDO cp "$merged" "$bc" && $SUDO chmod 644 "$bc"; then
-      miss=$(bl_missing "$bc")
-      if [ "$miss" -eq 0 ]; then
-        done_ "$(basename "$bc") updated in $jh ($(($(wc -l < "$merged")-1)) entries, all $EMUDHRA_COUNT compromised certificates now blocked)"; jdk_changed=1
-        echo "$(date '+%Y-%m-%d') sha256=$BC_SHA source=$BC_LABEL" | $SUDO tee "$bc.emudhra-installed" >/dev/null
-      else err_ "$bc written but $miss compromised certificates are still not blocked"; fi
-    else err_ "could not write $bc"; fi
-    rm -f "$merged"
   done
   if [ $jdk_changed -eq 1 ]; then
-    if [ "$ROLE" != dev ]; then
-      info "running Gradle daemons keep the old trust store until they restart; JDK upgrades restore the old cacerts and the next policy run re-applies the fix"
-    elif command -v gradle >/dev/null 2>&1; then
+    MANUAL+=("Restart running Java processes and Gradle daemons (./gradlew --stop) so they drop the removed roots")
+    MANUAL+=("A JDK update installs a fresh cacerts: move to a fixed JDK ($JDK_FIXED_BUILDS) so the fix sticks")
+    if [ "$ROLE" = dev ] && command -v gradle >/dev/null 2>&1; then
       gradle --stop >/dev/null 2>&1 && done_ "stopped Gradle daemons"
-      MANUAL+=("JDK upgrades restore the old cacerts: re-run this script after each until a fixed JDK ships")
-    else
-      MANUAL+=("Restart Gradle daemons (./gradlew --stop) so builds pick up the new trust store")
-      MANUAL+=("JDK upgrades restore the old cacerts: re-run this script after each until a fixed JDK ships")
     fi
   fi
 }
@@ -1436,17 +1250,15 @@ record_dev_actions() {
 
 # Fleet audit mode: list what remediate would do, change nothing.
 record_java_actions() {
-  local e jh ks alias needbc
+  local e jh ks roots
   for e in "${JDK_FIX[@]}"; do
-    IFS='|' read -r jh ks alias needbc bc <<EOF
+    IFS='|' read -r jh ks roots <<EOF
 $e
 EOF
-    [ -n "$alias" ] && restate "JDK $jh: delete G3 alias(es) ${alias//;/, } from cacerts (remediate with root removal enabled does this)"
-    [ "$needbc" = "1" ] && restate "JDK $jh: merge Oracle's blocklist into $bc (remediate mode does this)"
+    restate "JDK $jh: remove ${roots//;/, } from cacerts, or install a fixed JDK ($JDK_FIXED_BUILDS); remediate mode removes them with a backup"
   done
   return 0
 }
-
 run_fixes() {
   FIXED=0; SKIPPED=0; ERRORS=${ERRORS:-0}
   if [ "$ROLE" != dev ] && [ "$MODE" = audit ]; then
@@ -1489,7 +1301,7 @@ run_pass() {
     say ""; say "${B}Remediation available${N}"
     [ ${#NODE_FIX[@]} -gt 0 ]    && say "  - Node: ${#NODE_FIX[@]} unpatched install(s)"
     [ -n "$BREW_PKGS" ]          && say "  - Homebrew: brew upgrade $BREW_PKGS"
-    [ ${#JDK_FIX[@]} -gt 0 ]     && say "  - Java: ${#JDK_FIX[@]} JDK(s) (cacerts root removal and/or Oracle blocked.certs)"
+    [ ${#JDK_FIX[@]} -gt 0 ]     && say "  - Java: ${#JDK_FIX[@]} JDK(s) still trust the distrusted roots (removed from cacerts, with a backup)"
     [ ${#PIP_FIX[@]} -gt 0 ]     && say "  - pip: ${#PIP_FIX[@]} interpreter(s) below 26.2.2"
     [ ${#CERTIFI_FIX[@]} -gt 0 ] && say "  - Python: certifi in ${#CERTIFI_FIX[@]} interpreter(s)"
     [ ${#UV_FIX[@]} -gt 0 ]      && say "  - uv: ${#UV_FIX[@]} install(s) below 0.13.4"
@@ -1592,6 +1404,8 @@ print_summary() {
   echo "=========================================================="
 }
 
+[ $EMSIGN_SOURCED -eq 1 ] && return 0
+
 # =============================================================================
 # Entry points
 # =============================================================================
@@ -1602,8 +1416,7 @@ if [ "$ROLE" = dev ]; then
     f=""; [ ${#RESULTS[@]} -gt 0 ] && f=$(printf '%s; ' "${RESULTS[@]}" | sed "s/$US/ | fix: /g")
     echo "<result>$st ($FAIL fail, $WARN warn) ${f% }</result>"; exit 0
   fi
-  [ $ERRORS -gt 0 ] && [ "$st" != EXPOSED ] && st=UNVERIFIED
-  case "$st" in EXPOSED) rc=2 ;; UNVERIFIED) rc=3 ;; VENDOR_PENDING) rc=1 ;; *) rc=0 ;; esac
+  st=$(dev_status); rc=$(status_rc "$st")
   for r in ${RESULTS[@]+"${RESULTS[@]}"}; do SUM_ITEMS+=("|$r"); done
   for a in ${ACTIONS[@]+"${ACTIONS[@]}"}; do SUM_ACTIONS+=("|$a"); done
   for a in ${NOT_COVERED[@]+"${NOT_COVERED[@]}"}; do SUM_NOTC+=("$a"); done
@@ -1641,28 +1454,14 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 WORK=$(mktemp -d /tmp/emsign-check.XXXXXX) || exit 2
 chmod 755 "$WORK"
-cleanup() { rm -rf "$WORK" "$LOCK"; [ -n "$BCNEW" ] && rm -f "$BCNEW"; }
+cleanup() { rm -rf "$WORK" "$LOCK"; }
 trap cleanup EXIT
 if ! { cp "$0" "$WORK/jamf-emsign.sh" && chmod 755 "$WORK/jamf-emsign.sh"; }; then
   line ERROR "cannot stage script copy"; exit 2
 fi
 
-line INFO "===== emsign-check v$VERSION start: mode=$MODE users=$USER_SCOPE verbose=$VERBOSE fail_on_exposed=$FAIL_ON_EXPOSED recon=$RUN_RECON remove_roots=$REMOVE_ROOTS ====="
+line INFO "===== emsign-check v$VERSION start: mode=$MODE users=$USER_SCOPE verbose=$VERBOSE fail_on_exposed=$FAIL_ON_EXPOSED recon=$RUN_RECON ====="
 line INFO "host=$(hostname 2>/dev/null) serial=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/{print $4}') console_user=$(stat -f%Su /dev/console 2>/dev/null || echo n/a)"
-dbg "blocked.certs: url=${BLOCKED_CERTS_URL:-<none>} file=${BLOCKED_CERTS_FILE:-<none>} sha256=${BLOCKED_CERTS_SHA256:-<none>}"
-
-# Stage the reference blocklist once (embedded, or a pinned override); user
-# passes get a read-only copy so every account is judged against the same list.
-STAGED_BC=""; STAGED_LABEL=""
-if get_blocked; then
-    STAGED_BC="$WORK/blocked.certs"; cp "$BCNEW" "$STAGED_BC" && chmod 644 "$STAGED_BC"
-    BLOCKED_CERTS_FILE="$STAGED_BC"
-    STAGED_LABEL=$(printf '%s' "$BC_SRC" | sed 's#.*/##; s/[^A-Za-z0-9._-]/_/g'); BLOCKED_CERTS_LABEL="$STAGED_LABEL"
-    line INFO "reference blocklist: $BC_COUNT entries, sha256 $BC_SHA, source $BC_SRC"
-else
-    line ERROR "no reference blocklist; JDKs cannot be evaluated"
-fi
-
 AGG_PASS=0; AGG_WARN=0; AGG_FAIL=0; AGG_FIXED=0; AGG_ERR=0; AGG_PEND=0; AGG_UNV=0
 AGG_RESULTS=(); AGG_ACTIONS=(); AGG_NOTC=(); USERS_SCANNED=""; USERS_FAILED=""
 agg_add_result() { AGG_RESULTS+=("$1"); }
@@ -1706,11 +1505,6 @@ for u in $(list_users); do
   line INFO "===== user pass: $u (home $h) ====="
   uargs="--user-pass --label=user:$u --mode=$MODE"
   [ $VERBOSE -eq 1 ] && uargs="$uargs --verbose"
-  [ $REMOVE_ROOTS -eq 1 ] && uargs="$uargs --remove-roots"
-  [ -n "$STAGED_BC" ] && uargs="$uargs --blocked-file=$STAGED_BC"
-  [ -n "$STAGED_LABEL" ] && uargs="$uargs --blocked-label=$STAGED_LABEL"
-  [ -n "$STAGED_BC" ] && uargs="$uargs --blocked-sha256=$BC_SHA"
-  [ -z "$STAGED_BC" ] && uargs="$uargs --blocked-unavailable"
   got_summary=0
   # shellcheck disable=SC2086
   while IFS= read -r l; do
