@@ -91,7 +91,7 @@
 
 set -u
 shopt -s nullglob
-VERSION="3.1.0"
+VERSION="3.1.1"
 ORG_DIR="/Library/Application Support/emsign-check"
 STATUS_PLIST="$ORG_DIR/status.plist"
 LOGFILE="${EMSIGN_LOGFILE:-/var/log/emsign-check.log}"
@@ -287,6 +287,11 @@ JDK_DISTRUST_ALIAS_RE='emsigneccrootcag3|emsignrootcag1|emsignrootcag2|comodoaaa
 JDK_FIXED_BUILDS="8u511-b33, 11.0.33.0.3, 17.0.21.0.3, 21.0.13.0.3, 25.0.5.0.3, 27.0.1.0.3 (or a vendor build with JDK-8395690)"
 COMPROMISED_KEYS="EBED6475C2C2D80FCB199F3FE8DD6E6B3CE60B77EB15D4E42C3DEC0C6F5B5105 43BFFA19D6EF651451F6841E019931E96F6F2EAEFF28AB4B6F1CE4576DE2717B E0254C7FCDC265E2F0F8A428DABB75AB4AE039B4872D62F5EE57F0877D5A8A41 49DD353DC2B919A3770645117D0E60C16115E7D1BC259EEFE734B00EA434FE5F 63ECEFEE431D49523BC1136C4E72D0206A477086CAF606CD5CF025686C109CF8 5C0660A2B164910D8FF589C18E14552E9E0EC237DCEFE2CB736D41A4811F81A0 EC4FFA1AD0AC88081314B7AAFFEF6A91F97CD57291BB5BA686C5415F5EB4F6B6 92C063D67E8F14DB71D288E11266FFDAF69CBF115F7BAB14F3BC2F68D25E0E30"
 SUSPECT_RE='CN *= *(emSign (ECC Root CA|Root TLS CA|Root CS CA) - G3|AAA Certificate Services|EM (DV|OV|EV) (TLS|CS) CA - G3[BC])'
+# macOS's command-line trust bundle. Apple blocks the certificates for its own
+# frameworks, but this file is only fixed by a future macOS update (Apple, support
+# article 149555); Apple documents an optional manual edit for admins until then.
+MACOS_CERT_PEM=/etc/ssl/cert.pem
+MACOS_CERT_FIX="Waits on a macOS update (Apple support 149555). Until then admins may remove emSign ECC Root CA - G3 (and optionally AAA Certificate Services) from /etc/ssl/cert.pem as Apple describes; prefer Homebrew curl/git/python meanwhile"
 if [ -x /usr/bin/openssl ]; then OPENSSL=/usr/bin/openssl; else OPENSSL=$(command -v openssl 2>/dev/null || echo openssl); fi
 
 key_class() {   # key_class SPKI SUBJECT
@@ -592,8 +597,7 @@ audit_macos() {
     fi
   done
   [ $found -eq 0 ] && ok "no admin/system trust settings for affected certificates"
-  check_bundle /etc/ssl/cert.pem "macOS /etc/ssl/cert.pem (used by /usr/bin/curl, system Ruby, LibreSSL tools; OS-managed)" pend \
-    "Install the macOS update that refreshes it; until then prefer Homebrew curl over /usr/bin/curl"
+  check_bundle "$MACOS_CERT_PEM" "macOS /etc/ssl/cert.pem (used by /usr/bin/curl, git, python3, system Ruby, perl, openssl; OS-managed)" pend "$MACOS_CERT_FIX"
 }
 
 audit_env() {
@@ -929,13 +933,21 @@ audit_git() {
   return 0
 }
 
+# True when FILE is macOS's own /etc/ssl/cert.pem (any path that resolves to it).
+is_macos_bundle() { [ -e "$MACOS_CERT_PEM" ] && [ "$(rp "$1")" = "$(rp "$MACOS_CERT_PEM")" ]; }
+
 audit_other() {
   hdr "Other runtimes"
-  local rb cf
+  local rb cf rv
   rb=$(command -v ruby 2>/dev/null)
   if [ -n "$rb" ] && mine "$rb"; then
     cf=$(probe_ruby 20 "$rb" -ropenssl -e 'print OpenSSL::X509::DEFAULT_CERT_FILE' 2>/dev/null)
-    [ -n "$cf" ] && [ -f "$cf" ] && check_bundle "$cf" "ruby $(probe_ruby 10 "$rb" -e 'print RUBY_VERSION' 2>/dev/null)"
+    rv=$(probe_ruby 10 "$rb" -e 'print RUBY_VERSION' 2>/dev/null)
+    if [ -n "$cf" ] && [ -f "$cf" ]; then
+      # System Ruby reads Apple's bundle: same file, same verdict as the macOS check (waits on Apple).
+      if is_macos_bundle "$cf"; then check_bundle "$cf" "ruby $rv (uses macOS /etc/ssl/cert.pem)" pend "$MACOS_CERT_FIX; or use Homebrew Ruby"
+      else check_bundle "$cf" "ruby $rv" fail "Update the bundle Ruby uses (Homebrew: brew upgrade ca-certificates)"; fi
+    fi
   fi
   [ "$ROLE" = dev ] || return 0
   command -v cargo >/dev/null 2>&1 && NOT_COVERED+=("Rust projects: webpki-roots must be >= 1.0.10 and rustls-webpki >= 0.103.16 (check each Cargo.lock)")
