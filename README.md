@@ -1,153 +1,114 @@
-# eMudhra Certificate Remediation: Developer Mac Guide
+# check-local-certs
 
-Oct 21, 2026 · @Lucas
+Scripts for the October 2026 eMudhra/emSign intermediate certificate compromise. `jamf-emsign.sh` checks whether a Mac's command-line tools and language runtimes still trust the compromised certificates, and fixes what it safely can. The same script runs on a developer's Mac and as a Jamf policy.
 
-## What happened
+| File | What it is |
+| --- | --- |
+| `jamf-emsign.sh` | The audit and remediation script (v3.1.0). Bash 3.2, no dependencies beyond macOS. |
+| `tests/run-tests.sh` | Test suite for `jamf-emsign.sh`, with public certificate fixtures in `tests/fixtures/`. |
+| `eMudhra Certificate Remediation: Developer Mac Guide.md` | Guide for developers: what happened, what each finding means and how to fix it by hand. |
+| `emsign-check.sh` | The earlier developer-only script, kept for reference. Its guide is in `docs/emsign-check-guide.md`. |
 
-Every developer Mac needs its Node, Java and Python trust stores updated this week; browsers are already protected. On 17 October 2026 the private keys of eight eMudhra certificate authorities were found to be trivially weak. Anyone holding them can mint a certificate for any site that an unpatched tool will accept.
+## Run it on your Mac
 
-Safari, Chrome and Firefox blocked the certificates within days. Command-line tools and language runtimes carry their own copy of trusted roots and do not check revocation, so they still trust forged certificates until updated:
-
-- **Node.js** (npm, Yarn): fixed releases shipped 21 October.
-- **Java**: every JDK, including the ones bundled inside IntelliJ and Android Studio.
-- **Python**: Homebrew's CA bundle and certifi inside each virtualenv.
-- **Go**: fixed in 1.26.10 and 1.27.3; binaries built with older toolchains need a rebuild.
-
-The root on the compromised path is **emSign ECC Root CA - G3**. Other emSign roots (G1, C1, ECC C3) are not affected.
-
-Fix time: about 20–30 minutes per machine.
-
-## 1. Run the audit
-
-Run the audit script first. If it finds problems, it asks whether to fix them and confirms each change before making it, so most machines need nothing else. Sections 2–4 are the manual steps it automates, for anything it skips or can't do.
+Run it as yourself, not with `sudo`. It audits first, then offers fixes and asks before each one.
 
 ```bash
-# Get emsign-check.sh from: <INTERNAL LOCATION – repo, wiki or Self Service>
-chmod +x emsign-check.sh
-
-# Oracle's site rejects scripted downloads, so the script fetches the Java
-# blocklist from our internal mirror and checks its hash:
-export BLOCKED_CERTS_URL="<INTERNAL MIRROR URL>/blocked.certs"
-export BLOCKED_CERTS_SHA256="<SHA-256 FROM THE TEAM>"
-
-./emsign-check.sh          # add --deep to also scan virtualenvs and vendored bundles
+chmod +x jamf-emsign.sh
+./jamf-emsign.sh                 # audit, then offer fixes (asks before each one)
+./jamf-emsign.sh --audit-only    # report only, change nothing
+./jamf-emsign.sh --deep          # also scan $HOME and /Applications for vendored CA files
 ```
 
-- Answer **y** to "Proceed to remediation?", then y or n to each fix. It backs up every Java file it changes as `*.bak-<timestamp>`.
-- It skips the JDKs bundled in IntelliJ and Android Studio and anything needing admin rights you decline; those show under **Manual steps**.
-- It re-runs the audit at the end to verify. Use `--audit-only` to just report.
+| Option | Effect |
+| --- | --- |
+| `--audit-only` | Report only; never prompt or change anything |
+| `--deep` | Also search `$HOME` and `/Applications` for bundled CA files (slower) |
+| `--yes` | Approve the routine fixes without prompting: Node, Homebrew, Java root removal, pip, certifi, uv |
+| `--allow-destructive` | With `--yes`, also uninstall old Node versions (otherwise that always needs an interactive answer) |
+| `--verbose` | Debug detail for each check |
+| `--no-color` | Plain output |
+| `--ea` | Print one `<result>` line only, and exit 0 |
+| `--help` | Print the full usage from the script header |
 
-The result is one of three states:
+Java fixes back up `cacerts` as `cacerts.emsign-bak-<timestamp>` before any change. The run ends with a **SUMMARY** block: the status, then **Fix now** (each item with its fix), **Waiting on a vendor**, and **Review**.
 
-| Result | Exit code | Meaning |
+| Status | Exit code | Meaning |
 | --- | --- | --- |
-| CLEAN | 0 | Nothing to do |
-| WARN | 1 | OS-managed items or mitigations to review; no action unless listed below |
-| EXPOSED | 2 | At least one runtime still trusts the compromised chain |
+| PROTECTED | 0 | Every inspected runtime rejects the compromised certificates |
+| VENDOR_PENDING | 1 | Nothing left to fix; the rest waits on Apple or an IDE vendor |
+| EXPOSED | 2 | Something still trusts the compromised certificates and has a fix |
+| UNVERIFIED | 3 | Something could not be checked; see **Review** |
 
-Find each FAIL line's section heading (Node.js, Java, Python, Go) and apply the matching fix.
+WARN lines are advisories and never change the status. For what each finding means and how to fix it by hand, see the Developer Mac Guide.
 
-## 2. Node.js, npm and Yarn
+## Run it in Jamf
 
-Upgrade every installed Node version to a fixed release, not just your default; npm and Yarn 1 run on the active Node, so they are fixed with it.
+As a Jamf policy the script runs as root. It does a system pass, then one pass per local user (UID 501 and up, with a home folder), each run as that user with a clean environment. Root never executes a binary a user owns. In `remediate` mode only Java is changed unattended; Node, Homebrew, pip and uv need the developer, so they are reported as actions.
 
-| Line | Minimum fixed version |
-| --- | --- |
-| 26.x | 26.12.1 |
-| 24.x | 24.22.1 |
-| 22.x | 22.23.4 |
-| 20.x and older | No fix (end of life); move to 22 or 24 |
+### 1. Add the script
 
-With nvm:
+In Jamf Pro, go to **Settings → Computer management → Scripts → New**, paste in `jamf-emsign.sh`, and label the parameters:
+
+| Parameter | Label | Values | Default |
+| --- | --- | --- | --- |
+| $4 | Mode | `audit` or `remediate` | `audit` |
+| $5 | Verbose logging | `1` or `0` | `1` |
+| $6 | Fail policy if exposed | `yes` or `no` | `yes` |
+| $7 | Run jamf recon afterwards | `yes` or `no` | `no` |
+| $8 | Users to scan | `all` or `console` | `all` |
+
+`remediate` removes the four roots Oracle distrusted on 24 October (emSign ECC Root CA - G3, emSign Root CA - G1, emSign Root CA - G2 and AAA Certificate Services) from each unpatched JDK's `cacerts`. It keeps a verified backup, edits a staged copy, verifies it and then swaps it in. JDKs bundled inside IntelliJ or Android Studio are never edited.
+
+### 2. Add the extension attribute
+
+Create a computer extension attribute (**Settings → Computer management → Extension attributes**, input type Script) with this script. It reads the status file the policy writes, so inventory updates do not rescan the Mac:
 
 ```bash
-nvm ls                                    # see every installed version
-nvm install 24 --reinstall-packages-from=current
-nvm install 22                            # only if a project still needs 22
-nvm alias default 24
-nvm uninstall 24.16.0                     # repeat for each old version the audit flagged
-node --version                            # confirm
+#!/bin/bash
+f="/Library/Application Support/emsign-check/status.plist"
+[ -f "$f" ] || { echo "<result>Not run</result>"; exit 0; }
+r=$(/usr/libexec/PlistBuddy -c "Print :Result" "$f" 2>/dev/null)
+d=$(/usr/libexec/PlistBuddy -c "Print :LastRun" "$f" 2>/dev/null)
+echo "<result>$r ($d)</result>"
 ```
 
-With Homebrew: `brew upgrade node` (or `node@22`). With Volta: `volta install node@24`.
+Build smart groups on results that start with `EXPOSED` and `UNVERIFIED`.
 
-**If you set** `NODE_OPTIONS=--use-system-ca`: Node versions before 22.15 refuse to start with it, so remove those versions. The flag also pulls in macOS's roots, and Apple's revocation does not protect Node, so the upgrade is still required.
+### 3. Test on one Mac first
 
-After upgrading, delete and reinstall `node_modules` only if a project pins an `engines` range the new version breaks; the fix itself needs no reinstall.
+The script takes the same code path under `sudo` as under Jamf. `$1`–`$3` stand in for Jamf's mount point, computer name and user:
 
-## 3. Java (JDK 21 and any other JDK)
+```bash
+sudo ./jamf-emsign.sh / "$(hostname)" "$USER" audit
+sudo ./jamf-emsign.sh / "$(hostname)" "$USER" remediate 1 no no console
+# or with flags:
+sudo ./jamf-emsign.sh --mode=audit --verbose --users=console
+```
 
-No patched JDK has shipped yet, so remove the affected root from each JDK the audit flags and install Oracle's updated blocklist. Java does not check revocation by default, so both steps matter.
+### 4. Roll out
 
-1. Remove the root from the JDK's `cacerts`. Use the JDK path and the alias the audit printed on the FAIL line:
+1. Scope a policy running the script with $4 = `audit`. Nothing is changed; each Mac's log and status file list what `remediate` would do.
+2. Once the audit results look right, switch $4 to `remediate` to fix Java fleet-wide.
+3. Re-run on a schedule: a JDK update installs a fresh `cacerts`, so the fix only sticks once each Mac has a fixed JDK (8u511-b33, 11.0.33.0.3, 17.0.21.0.3, 21.0.13.0.3, 25.0.5.0.3, 27.0.1.0.3, or a vendor build with JDK-8395690).
 
-   ```bash
-   JH="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"   # the flagged JDK
-   "$JH/bin/keytool" -list -cacerts -storepass changeit | grep -i emsign
-   "$JH/bin/keytool" -delete -cacerts -storepass changeit -alias "<alias from audit>"
-   ```
-2. Install Oracle's updated `blocked.certs` from our internal mirror, the same copy the script uses, and confirm its hash before installing. It blocks the eight keys themselves, which also covers the Sectigo cross-signed copies that root removal cannot. Don't curl it from Oracle directly: ops.java answers scripted requests with 403 Forbidden. If the mirror is down, download the non-Windows file in a browser from [ops.java/emudhra](https://ops.java/emudhra) and check its hash the same way.
+### Outputs
 
-   ```bash
-   curl -fsSL -o /tmp/blocked.certs "<INTERNAL MIRROR URL>/blocked.certs"
-   shasum -a 256 /tmp/blocked.certs          # must equal <SHA-256 FROM THE TEAM>
-   cp "$JH/lib/security/blocked.certs" "$JH/lib/security/blocked.certs.bak"
-   cp /tmp/blocked.certs "$JH/lib/security/blocked.certs"
-   ```
-3. Restart Gradle daemons so builds pick up the change: `./gradlew --stop`.
-4. Re-run the audit. `brew upgrade` reinstalls a fresh `cacerts`, so repeat steps 1–2 after any JDK upgrade until a fixed JDK ships.
+- The policy log (stdout) and `/var/log/emsign-check.log` (rotated at 5 MB).
+- `/Library/Application Support/emsign-check/status.plist`: result, last run, counts, users scanned, failures and actions.
+- Exit code: 0 for PROTECTED or VENDOR_PENDING; 1 for EXPOSED or UNVERIFIED when $6 is `yes`; 2 for bad parameters or when the script could not run.
 
-**JDKs inside IntelliJ or Android Studio:** do not edit files inside the `.app` bundle, since that can break its code signature and updates. Instead, set **Settings → Build Tools → Gradle → Gradle JVM** to the JDK you fixed, and update the IDE when JetBrains or Google ships a new runtime.
+Limits: Jamf runs do not load shell profiles, so variables a developer exports there (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `JAVA_HOME`) are only seen when developers run the script themselves.
 
-**Optional hardening:** add `-Dcom.sun.net.ssl.checkRevocation=true -Dcom.sun.security.enableCRLDP=true` to `JAVA_TOOL_OPTIONS`. Test it first, because connections fail where CRL endpoints are unreachable.
+## Run the tests
 
-## 4. Python, Homebrew, Go and the rest
+```bash
+tests/run-tests.sh                        # tests ./jamf-emsign.sh
+tests/run-tests.sh path/to/jamf-emsign.sh # tests another copy
+```
 
-Most of these are one command each; the macOS system bundle is the exception and waits on Apple.
+- **Needs** bash, `openssl` and `perl`. The Java cases use a real `keytool` from `JAVA_HOME` or `PATH` (any JDK 9+); without one they are reported as skipped.
+- **Safe to run anywhere**: macOS or Linux, no root needed. The suite sources the script, which loads its functions without starting a pass. All test input is generated in a temporary directory that is deleted afterwards.
+- **Output**: one line per case grouped by area (bundles, certificate directories, keytool, Java policy, cross-signed path, environment, Node, Go, Gradle, Python, exit contract, command line), then `RESULT: N passed, N failed, N skipped`. The exit code is 0 only when nothing failed.
 
-| Audit FAIL/WARN | Fix |
-| --- | --- |
-| Homebrew bundle (`/opt/homebrew/etc/ca-certificates/cert.pem`) | `brew update && brew upgrade ca-certificates` |
-| Python `ssl default` | Same as above; Homebrew Python uses that bundle |
-| Python `certifi` (older than 2026.10.19) | In each virtualenv: `pip install -U certifi`; pipx tools: `pipx upgrade-all` |
-| Go older than 1.26.10 / 1.27.3 | `brew upgrade go`, then rebuild any Go binaries you built or installed with `go install` |
-| Rust projects | `cargo update -p webpki-roots` (needs 1.0.10 or later) |
-| Docker images | Rebuild on updated base images; containers do not use your Mac's trust |
-| `/etc/ssl/cert.pem` (WARN, OS-managed) | Cannot be edited (System Integrity Protection). Install the next macOS update when it ships; until then prefer Homebrew `curl` over `/usr/bin/curl` |
-
-Run `./emsign-check.sh --deep` once to find certifi copies inside old virtualenvs and app bundles; delete virtualenvs you no longer use instead of patching them.
-
-## 5. Verify and report back
-
-You are done when the audit ends in CLEAN, or in WARN where the only warnings are `/etc/ssl/cert.pem` (waits on Apple) and IDE-bundled runtimes (wait on JetBrains or Google). If the script reports a `blocked.certs` download failure, check that `BLOCKED_CERTS_URL` and `BLOCKED_CERTS_SHA256` are set as in step 1. As a fallback, download the file in a browser from [ops.java/emudhra](https://ops.java/emudhra) and run `BLOCKED_CERTS_FILE=~/Downloads/blocked.certs ./emsign-check.sh`.
-
-- [ ] Re-run `./emsign-check.sh` and confirm no FAIL lines
-- [ ] Post the final `Result:` line to \<CHANNEL OR TICKET> by \<DEADLINE>
-- [ ] Re-run after any `brew upgrade`, JDK install or new Node version until fixed JDKs ship
-
-## For maintainers: hosting the Java blocklist
-
-Host one vetted copy of Oracle's `blocked.certs` internally, so every Mac installs the identical file; ops.java rejects scripted downloads with 403.
-
-1. Download the non-Windows `blocked.certs` from [ops.java/emudhra](https://ops.java/emudhra) in a browser.
-2. Commit it to an internal repo or web server, and record its hash: `shasum -a 256 blocked.certs`.
-3. Fill in `<INTERNAL MIRROR URL>` and `<SHA-256 FROM THE TEAM>` in this guide, or set them as defaults in the script or your MDM/Self Service wrapper.
-4. When Oracle updates the file, repeat steps 1–3. The script refuses any file whose hash does not match `BLOCKED_CERTS_SHA256`.
-
-## FAQ
-
-**My browser is fine, so why does this matter?** Builds, package installs and API clients run outside the browser. A forged certificate could serve a tampered package to `npm install` or a Gradle build on an untrusted network.
-
-**Do I need to replace our own certificates?** No, unless they were issued by eMudhra/emSign. This is about what your tools trust, not what they present.
-
-**Will removing the root break anything?** Only sites with eMudhra G3-chain certificates, which eMudhra has stopped issuing. Internal and DoD CAs are unaffected.
-
-**The audit flags an emSign root I left alone.** Only emSign ECC Root CA - G3 is flagged as affected; tell \<CONTACT> if anything else shows as FAIL.
-
-## Sources
-
-- [eMudhra Intermediate CA Compromise – disclosure and fixed-version list](https://emudhra.we-have-a-problem.com/)
-- [Oracle: Distrusting eMudhra intermediates in the JDK](https://ops.java/emudhra)
-- [easyDNS advisory: Node.js security releases, 21 Oct 2026](https://easydns.com/blog/2026/10/21/customer-security-advisory-critical-updates-for-php-node-js-and-certificate-trust/)
-- [Root store analysis: which emSign roots are on the affected path](https://gist.github.com/UlisesGascon/10ed0724930e5382b3ed48fa2b0d3e02)
-- [Mozilla bug 2083709: emSign C1 and ECC C3 retirement](https://bugzilla.mozilla.org/show_bug.cgi?id=2083709)
+The fixtures in `tests/fixtures/` are public root certificates only; `tests/fixtures/README.md` lists each one with its fingerprints and source.

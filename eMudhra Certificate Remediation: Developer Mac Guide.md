@@ -1,6 +1,6 @@
 # eMudhra Certificate Remediation: Developer Mac Guide
 
-Oct 23, 2026 · @Lucas
+Oct 26, 2026 · @Lucas · for `jamf-emsign.sh` v3.1.0
 
 ## What happened
 
@@ -27,11 +27,11 @@ chmod +x jamf-emsign.sh
 ./jamf-emsign.sh                 # audit, then offer fixes (asks before each one)
 ./jamf-emsign.sh --audit-only    # report only, change nothing
 ./jamf-emsign.sh --deep          # also scan virtualenvs and app-bundled CA files
+./jamf-emsign.sh --help          # every option
 ```
 
-- Nothing to download: Oracle's Java blocklist is built into the script.
-- Answer **y** to "Proceed to remediation?", then y or n to each fix. Java files are backed up as `*.bak-<timestamp>` before any change.
-- `--yes` approves the routine fixes only. Removing old Node versions or Java roots still needs your interactive answer (or `--allow-destructive`).
+- Answer **y** to "Proceed to remediation?", then y or n to each fix. Java's `cacerts` is backed up as `cacerts.emsign-bak-<timestamp>` before any change.
+- `--yes` approves the routine fixes without prompting, including the Java root removal. Uninstalling old Node versions still needs your interactive answer (or `--yes --allow-destructive`).
 - Run it from any folder; npm and Yarn are never started inside your projects, so a pinned package manager cannot stall it.
 
 The run ends with a **SUMMARY** block: a STATUS line, then **Fix now** (each item with its fix), **Waiting on a vendor**, and **Review**.
@@ -77,16 +77,17 @@ After upgrading, delete and reinstall `node_modules` only if a project pins an `
 
 ## 3. Java (JDK 21 and any other JDK)
 
-A JDK is fixed when its blocklist blocks all 16 compromised certificates (the 8 intermediates, each issued by emSign and cross-signed by Sectigo). The script checks the blocklist itself, so a patched vendor JDK passes even though the emSign root is still in its `cacerts`. That is expected.
+Oracle changed its guidance on 24 October (CVE-2026-114820, JDK-8395690): the 21 October blocklist builds are now listed as affected. A JDK is fixed only when its `cacerts` no longer trusts the four roots Oracle removed: **emSign ECC Root CA - G3**, **emSign Root CA - G1**, **emSign Root CA - G2** and **AAA Certificate Services** (aliases `emsigneccrootcag3`, `emsignrootcag1`, `emsignrootcag2`, `comodoaaaca`). The script matches them by key, so a renamed copy is still found, and reports `blocked.certs` for context only.
 
-Fix in this order, as Oracle recommends:
+Fix in this order:
 
-1. **Install a patched JDK** where your vendor has one: Oracle/OpenJDK 8u511, 11.0.33.0.2, 17.0.21.0.2, 21.0.13.0.2, 25.0.5.0.2 or 27.0.1.0.2; Corretto 21.0.13.0.10. Homebrew's `openjdk@21` 21.0.13 is not a fixed build yet.
-2. **Otherwise let the script merge Oracle's blocklist.** Answer y to "Merge Oracle's blocklist". It writes the file that JDK actually reads (`lib/security/blocked.certs`; on Java 8, `jre/lib/security/blacklisted.certs`), keeps a backup, and verifies all 16 entries afterwards. Then restart Gradle daemons: `./gradlew --stop`.
+1. **Install a fixed JDK** where your vendor has one: 8u511-b33, 11.0.33.0.3, 17.0.21.0.3, 21.0.13.0.3, 25.0.5.0.3 or 27.0.1.0.3, or a vendor build that includes JDK-8395690.
+2. **Otherwise let the script remove the four roots**, which is what the fixed builds ship. Answer y to "Remove … distrusted root(s)". It keeps a verified backup (`cacerts.emsign-bak-<timestamp>`), edits a staged copy, verifies it and only then swaps it in. Only entries with those exact keys are removed; a same-named entry with another key goes to Review instead. Then restart running Java processes and Gradle daemons: `./gradlew --stop`.
 3. **Optionally add revocation checking:** `-Dcom.sun.net.ssl.checkRevocation=true -Dcom.sun.security.enableCRLDP=true` in `JAVA_TOOL_OPTIONS`. Test it first; connections fail where CRL endpoints are unreachable.
-4. **Root removal is a last resort**, never needed once step 1 or 2 is done. With `--remove-roots` the script offers to delete the emSign G3 root alias(es), matched by key, and asks you separately each time. It never removes AAA Certificate Services, which anchors unrelated Sectigo chains.
 
-JDK upgrades replace the blocklist, so re-run the script after each one until your vendor ships a fixed build.
+A JDK update installs a fresh `cacerts` with the roots back in, so re-run the script after each one until you are on a fixed build.
+
+To undo a removal, copy the backup back over `cacerts` (for example `cp -p cacerts.emsign-bak-<timestamp> cacerts` in that JDK's `lib/security`).
 
 **JDKs inside IntelliJ or Android Studio** show under "Waiting on a vendor". Do not edit files inside the `.app` bundle (that breaks its signature). Set **Settings → Build Tools → Gradle → Gradle JVM** to a fixed JDK, and update the IDE when its vendor ships a new runtime. The script also checks the JDK named by `org.gradle.java.home` in `~/.gradle/gradle.properties`; commented-out lines are ignored.
 
@@ -118,24 +119,42 @@ You are done when the summary says **STATUS: PROTECTED**, or **STATUS: VENDOR\_P
 
 ## For maintainers: the Jamf policy
 
-The same `jamf-emsign.sh` runs as a Jamf policy script. As root, it does a system pass and then one pass per local user, each run as that user, so every account's Node, JDKs and Python are covered. Root never runs a program a user owns, and in remediate mode only Java is changed unattended.
+The same `jamf-emsign.sh` runs as a Jamf policy script. As root, it does a system pass and then one pass per local user, each run as that user, so every account's Node, JDKs and Python are covered. Root never runs a program a user owns, and in remediate mode only Java is changed unattended: the four distrusted roots are removed from each unpatched JDK's `cacerts`, with a verified backup. IDE-bundled JDKs are never edited.
 
 | Parameter | Purpose | Default |
 | --- | --- | --- |
 | $4 | `audit` or `remediate` | audit |
-| $5 | Newer Oracle blocklist URL (only if Oracle updates the file) | built-in list |
-| $6 | SHA-256 of that file (required with $5) | — |
-| $7 | Verbose log (1/0) | 1 |
-| $8 | Mark the policy failed when EXPOSED or UNVERIFIED | yes |
-| $9 | Run `jamf recon` afterwards | no |
-| $10 | Scan `all` users or only the `console` user | all |
-| $11 | Also remove emSign G3 roots from unpatched JDKs | no |
+| $5 | Verbose log (`1`/`0`) | 1 |
+| $6 | Mark the policy failed when EXPOSED or UNVERIFIED | yes |
+| $7 | Run `jamf recon` afterwards | no |
+| $8 | Scan `all` users or only the `console` user | all |
 
-1. Test on one Mac first: `sudo ./jamf-emsign.sh / "$(hostname)" "$USER" audit "" "" 1 no no console`.
-2. Roll out in **audit** mode. Each run writes `/Library/Application Support/emsign-check/status.plist`; the extension attribute in the script header reads it, so inventory updates do not rescan. Build smart groups on EXPOSED and UNVERIFIED.
-3. Switch $4 to **remediate** to fix Java fleet-wide. Node, Homebrew, pip and uv stay with developers (downloads and brew side effects); they appear under "Fix now" in each Mac's log and in the status file.
+1. Add `jamf-emsign.sh` under **Settings → Computer management → Scripts** and label $4–$8 as above.
+2. Add the extension attribute from the script header (also in `README.md`). It reads `/Library/Application Support/emsign-check/status.plist`, so inventory updates do not rescan. Build smart groups on EXPOSED and UNVERIFIED.
+3. Test on one Mac first; `sudo` takes the same code path as Jamf:
+
+   ```bash
+   sudo ./jamf-emsign.sh / "$(hostname)" "$USER" audit
+   sudo ./jamf-emsign.sh / "$(hostname)" "$USER" remediate 1 no no console
+   sudo ./jamf-emsign.sh --mode=audit --verbose --users=console   # same, with flags
+   ```
+4. Roll out in **audit** mode; nothing changes, and each Mac's log and status file list what remediate would do.
+5. Switch $4 to **remediate** to fix Java fleet-wide. Node, Homebrew, pip and uv stay with developers (downloads and brew side effects); they appear under "Fix now" in each Mac's log and in the status file. Keep the policy recurring: JDK updates restore the old `cacerts` until each Mac has a fixed build.
+
+Exit codes in Jamf: 0 for PROTECTED or VENDOR_PENDING; 1 for EXPOSED or UNVERIFIED when $6 is `yes`; 2 for bad parameters or when the script could not run.
 
 Limits: Jamf runs do not load shell profiles, so variables a developer exports there (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `JAVA_HOME`) are only seen when developers run the script themselves. Logs: the policy log and `/var/log/emsign-check.log`.
+
+## For maintainers: running the tests
+
+Run the test suite after any change to the script and before uploading a new version to Jamf:
+
+```bash
+tests/run-tests.sh                         # tests ./jamf-emsign.sh
+tests/run-tests.sh path/to/jamf-emsign.sh  # tests another copy
+```
+
+It needs bash, `openssl` and `perl`, and runs on macOS or Linux without root. The Java cases use a real `keytool` (any JDK 9+ on `PATH` or `JAVA_HOME`) and are reported as skipped without one. All test input is generated in a temporary directory that is deleted afterwards. The run ends with `RESULT: N passed, N failed, N skipped` and exits 0 only when nothing failed. The fixtures in `tests/fixtures/` are public root certificates only.
 
 ## FAQ
 
@@ -143,9 +162,9 @@ Limits: Jamf runs do not load shell profiles, so variables a developer exports t
 
 **Do I need to replace our own certificates?** No, unless they were issued by eMudhra/emSign. This is about what your tools trust, not what they present.
 
-**Why does a file with only AAA Certificate Services fail?** Sectigo cross-signed all eight compromised intermediates under AAA. Tools that read a CA file directly (curl, Python, Ruby) do not check revocation, so AAA in such a file accepts the compromised chains. Java is judged by its blocklist instead, because patched JDKs keep AAA.
+**Why does a file with only AAA Certificate Services fail?** Sectigo cross-signed all eight compromised intermediates under AAA. Tools that read a CA file directly (curl, Python, Ruby) do not check revocation, so AAA in such a file accepts the compromised chains. Java follows the same logic: Oracle's fixed builds remove AAA from `cacerts`.
 
-**Will the fix break anything?** The blocklist rejects only the 16 compromised certificates. Root removal is optional and only ever targets emSign G3 roots, which eMudhra no longer issues under.
+**Will the fix break anything?** In Java, sites whose only chain runs to one of the four removed roots stop validating, which is the same result Oracle's fixed JDKs give. The backup next to `cacerts` restores the previous state if you need it while you investigate.
 
 **What does "affected-looking names with unrecognized keys" mean?** A certificate is named like an affected one but its key does not match the published identities. The script sends it to Review rather than guessing; compare its fingerprint with the disclosure site.
 
