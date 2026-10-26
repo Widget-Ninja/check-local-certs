@@ -91,7 +91,7 @@
 
 set -u
 shopt -s nullglob
-VERSION="3.1.1"
+VERSION="3.1.2"
 ORG_DIR="/Library/Application Support/emsign-check"
 STATUS_PLIST="$ORG_DIR/status.plist"
 LOGFILE="${EMSIGN_LOGFILE:-/var/log/emsign-check.log}"
@@ -582,31 +582,73 @@ props_value() {
 # Audit sections
 # =============================================================================
 NOT_COVERED=()
+# trust_overrides < "security dump-trust-settings" output -> "VERDICT<TAB>name" for
+# each affected certificate. Format: "Cert N: <name>", "Number of trust settings : K",
+# then per setting "Trust Setting i:" ... "Result Type : kSecTrustSettingsResult...".
+# K = 0 means trusted as a root for everything ("Always Trust"); a setting with no
+# Result Type line defaults to TrustRoot. Verdicts: TRUSTED, DENY, UNSPECIFIED, UNKNOWN.
+TRUST_NAME_RE='^(emSign (ECC Root CA|Root TLS CA|Root CS CA) - G3|AAA Certificate Services|EM (DV|OV|EV) (TLS|CS) CA - G3[BC])$'
+trust_overrides() {
+  awk -v re="$TRUST_NAME_RE" '
+    function flush() {
+      if (name == "" || name !~ re) return
+      if (ns < 0) v = "UNKNOWN"
+      else if (ns == 0 || trusted || settings > results) v = "TRUSTED"
+      else if (deny) v = "DENY"
+      else v = "UNSPECIFIED"
+      print v "\t" name
+    }
+    { sub(/\r$/, "") }
+    /^Cert [0-9]+: / { flush(); name = substr($0, index($0, ": ") + 2); sub(/[ \t]+$/, "", name)
+                       ns = -1; trusted = 0; deny = 0; settings = 0; results = 0; next }
+    /Number of trust settings/ { v2 = $0; sub(/.*:[ \t]*/, "", v2); ns = v2 + 0; next }
+    /^[ \t]*Trust Setting [0-9]+:/ { settings++; next }
+    /Result Type/ { results++
+                    if ($0 ~ /TrustRoot|TrustAsRoot/) trusted = 1; else if ($0 ~ /Deny/) deny = 1; next }
+    END { flush() }'
+}
+
+# check_trust_settings DOMAINFLAG LABEL: "-d" = admin (incl. configuration profiles), "" = this user
+check_trust_settings() {
+  local flag="$1" label="$2" rows v nm hit=0
+  # shellcheck disable=SC2086
+  rows=$(security dump-trust-settings $flag 2>/dev/null | trust_overrides)
+  while IFS="$(printf '\t')" read -r v nm; do
+    [ -n "$v" ] || continue
+    hit=1
+    case "$v" in
+      TRUSTED) fail "$label: '$nm' is marked trusted on this Mac, which overrides Apple's block" \
+                    "Keychain Access > find '$nm' > Trust > 'Use System Defaults' (or remove the configuration profile that installed it)" ;;
+      DENY)    ok "$label: '$nm' is explicitly distrusted" ;;
+      UNSPECIFIED) ok "$label: '$nm' has a setting that defers to the system (no override)" ;;
+      *)       unv "$label: could not read the trust setting for '$nm'" "Check it in Keychain Access: Trust should be 'Use System Defaults' or 'Never Trust'" ;;
+    esac
+  done <<TSEOF
+$rows
+TSEOF
+  [ $hit -eq 0 ] && ok "$label: none for affected certificates"
+  return 0
+}
+
 audit_macos() {
   hdr "macOS system trust"
   info "macOS $(sw_vers -productVersion 2>/dev/null || echo '?') ($(uname -m))"
-  local n dom found=0
+  local n
   n=$(security find-certificate -a -c "emSign ECC Root CA - G3" \
         /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null | grep -c '"labl"')
   info "Apple root store has emSign ECC Root CA - G3: $([ "$n" -gt 0 ] && echo yes || echo no). Apple blocks the 8 intermediates via revocation for Security-framework apps (Safari, Chrome, Go on macOS); NOT for node --use-system-ca or OpenSSL tools"
   NOT_COVERED+=("Apple Security-framework revocation is not tested; keep macOS updated")
-  for dom in "-d" "-s"; do
-    if security dump-trust-settings $dom 2>/dev/null | grep -Eqi "emsign|AAA Certificate Services|EM (DV|OV|EV) (TLS|CS) CA - G3"; then
-      unv "trust setting on an emSign/AAA certificate (security dump-trust-settings $dom)" \
-          "Open Keychain Access and check whether it is marked Always Trust; a text match cannot tell Always from Never Trust"; found=1
-    fi
-  done
-  [ $found -eq 0 ] && ok "no admin/system trust settings for affected certificates"
+  # Admin domain only. The system domain (-s) is Apple's built-in root list: every
+  # shipped root appears there with "0 trust settings" (= default trust), so a
+  # match there is not an override and its presence is reported just above.
+  check_trust_settings -d "admin trust settings"
   check_bundle "$MACOS_CERT_PEM" "macOS /etc/ssl/cert.pem (used by /usr/bin/curl, git, python3, system Ruby, perl, openssl; OS-managed)" pend "$MACOS_CERT_FIX"
 }
 
 audit_env() {
   hdr "TLS environment"
   local v val rc
-  if security dump-trust-settings 2>/dev/null | grep -Eqi "emsign|AAA Certificate Services|EM (DV|OV|EV) (TLS|CS) CA - G3"; then
-    unv "user trust setting on an emSign/AAA certificate (security dump-trust-settings)" \
-        "Open Keychain Access and check whether it is marked Always Trust"
-  fi
+  check_trust_settings "" "user trust settings"
   if [ "$ROLE" = dev ]; then
     for v in SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO PIP_CERT; do
       val=$(printenv "$v")
