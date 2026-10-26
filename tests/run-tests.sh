@@ -7,7 +7,9 @@
 #   tests/run-tests.sh [path/to/jamf-emsign.sh]
 #
 # Needs openssl and perl. Java cases use a real keytool (any JDK 9+ on PATH or
-# JAVA_HOME); without one they are reported as skipped. Nothing outside a
+# JAVA_HOME); without one they are reported as skipped.
+# Each case is stopped after CASE_TIMEOUT seconds (default 30; the slowest takes
+# about 8s) and reported as a failure, so a hang never stalls the run. Nothing outside a
 # temporary directory is read as test input or changed.
 HERE=$(cd "$(dirname "$0")" && pwd)
 S=${1:-$HERE/../jamf-emsign.sh}
@@ -57,23 +59,40 @@ export -f tnote mkjdk aliases_in fullbl
 
 # case_ NAME EXPECT_REGEX FUNCTION
 # Output compared: "P=pass F=fail D=pending U=unverified W=advisory E=errors <tnote...>"
+# run_one FUNCTION: one case in a fresh state (called in a subshell by case_).
+# Kept as a top-level function: bash 3.2 (macOS) cannot parse a case statement
+# inside $( ... ), so nothing with a case pattern may live in a substitution.
+run_one() {
+  local fn=$1
+  T=$(mktemp -d "$TOP/c.XXXXXX"); export T HOME="$T/home"; mkdir -p "$HOME"; cd "$T" || exit
+  unset NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO PIP_CERT \
+        NODE_OPTIONS npm_config_cafile NPM_CONFIG_CAFILE JAVA_HOME JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS \
+        NODE_TLS_REJECT_UNAUTHORIZED GIT_SSL_NO_VERIFY PIP_TRUSTED_HOST \
+        NVM_DIR npm_config_strict_ssl NPM_CONFIG_STRICT_SSL GIT_CONFIG_GLOBAL
+  # (NVM_DIR etc. point at the developer's real installs; each case uses its own HOME.)
+  # shellcheck disable=SC1090
+  source "$S" >/dev/null 2>&1 || { echo SOURCE_FAILED; exit; }
+  ROLE=dev; MODE=audit; VERBOSE=0; YES=0; COLOR=0
+  PASS=0; WARN=0; FAIL=0; PEND=0; UNV=0; ERRORS=0; FIXED=0; SKIPPED=0
+  SEEN=""; BUNDLE_CACHE=""; RESULTS=(); ACTIONS=(); NOT_COVERED=(); MANUAL=()
+  NODE_FIX=(); JDK_FIX=(); CERTIFI_FIX=(); PIP_FIX=(); UV_FIX=(); BREW_PKGS=""; KS_ROOTS=""
+  security() { return 1; }
+  # Only runtimes this case created count; the machine's own installs are ignored.
+  mine() { case "$1" in "$T"/*) return 0 ;; *) return 1 ;; esac; }
+  "$fn" >"$T/stdout" 2>&1
+  echo "P=$PASS F=$FAIL D=$PEND U=$UNV W=$WARN E=$ERRORS $(cat "$T/extra" 2>/dev/null)"
+}
+
+# case_ NAME EXPECT_REGEX FUNCTION
+# Output compared: "P=pass F=fail D=pending U=unverified W=advisory E=errors <tnote...>"
 case_() {
   local name=$1 expect=$2 fn=$3 out
-  out=$(T=$(mktemp -d "$TOP/c.XXXXXX"); export T HOME="$T/home"; mkdir -p "$HOME"; cd "$T" || exit
-        unset NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO PIP_CERT \
-              NODE_OPTIONS npm_config_cafile NPM_CONFIG_CAFILE JAVA_HOME JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS \
-              NODE_TLS_REJECT_UNAUTHORIZED GIT_SSL_NO_VERIFY PIP_TRUSTED_HOST
-        # shellcheck disable=SC1090
-        source "$S" >/dev/null 2>&1 || { echo SOURCE_FAILED; exit; }
-        ROLE=dev; MODE=audit; VERBOSE=0; YES=0; COLOR=0
-        PASS=0; WARN=0; FAIL=0; PEND=0; UNV=0; ERRORS=0; FIXED=0; SKIPPED=0
-        SEEN=""; BUNDLE_CACHE=""; RESULTS=(); ACTIONS=(); NOT_COVERED=(); MANUAL=()
-        NODE_FIX=(); JDK_FIX=(); CERTIFI_FIX=(); PIP_FIX=(); UV_FIX=(); BREW_PKGS=""; KS_ROOTS=""
-        security() { return 1; }
-        # Only runtimes this case created count; the machine's own installs are ignored.
-        mine() { case "$1" in "$T"/*) return 0 ;; *) return 1 ;; esac; }
-        "$fn" >"$T/stdout" 2>&1
-        echo "P=$PASS F=$FAIL D=$PEND U=$UNV W=$WARN E=$ERRORS $(cat "$T/extra" 2>/dev/null)" 2>&1)
+  # Watchdog: a case that hangs (e.g. waiting on a prompt) fails after CASE_TIMEOUT
+  # seconds instead of stalling the run.
+  out=$(run_one "$fn" 2>&1 & pid=$!
+        perl -e 'sleep shift; kill "TERM", shift' "${CASE_TIMEOUT:-30}" "$pid" >/dev/null 2>&1 & w=$!
+        wait "$pid"; kill "$w" 2>/dev/null)
+  [ -n "$out" ] || out="TIMEOUT after ${CASE_TIMEOUT:-30}s (hung)"
   if printf '%s' "$out" | grep -Eq -- "$expect"; then
     NPASS=$((NPASS+1)); printf 'ok    %-62s %s\n' "$name" "$out"
   else
@@ -189,9 +208,11 @@ else
         tnote "unchanged=$([ "$(sha256_of "$ks")" = "$h0" ] && echo yes || echo no)" "actions=${#ACTIONS[@]}"; }
   case_ "fleet audit: nothing changed, action recorded" 'unchanged=yes actions=1' t
   t() { mkjdk "$T/jdk" "${ALL4[@]}"; local ks="$T/jdk/lib/security/cacerts" h0; h0=$(sha256_of "$ks")
-        JAVA_HOME="$T/jdk" audit_java; ROLE=dev; MODE=interactive; YES=0; fix_java </dev/null >/dev/null 2>&1
-        tnote "unchanged=$([ "$(sha256_of "$ks")" = "$h0" ] && echo yes || echo no)"; }
-  case_ "developer, no --yes, no terminal: nothing changed" 'unchanged=yes' t
+        # Through run_pass, the real entry point: without --yes and with stdin not a
+        # terminal it must stop after the audit and never prompt.
+        ROLE=dev; MODE=interactive; YES=0; JAVA_HOME="$T/jdk" run_pass </dev/null >/dev/null 2>&1
+        tnote "unchanged=$([ "$(sha256_of "$ks")" = "$h0" ] && echo yes || echo no)" "fixed=$FIXED"; }
+  case_ "developer, no --yes, no terminal: nothing changed" 'unchanged=yes fixed=0' t
   t() { mkjdk "$T/jdk" "${ALL4[@]}" "other [jdk]=$TOP/other.pem"; JAVA_HOME="$T/jdk" audit_java; YES=1; MODE=interactive; fix_java >/dev/null 2>&1
         tnote "left=[$(aliases_in "$T/jdk/lib/security/cacerts")]"; }
   case_ "developer --yes: roots removed" 'left=\[other \[jdk\]\]' t
@@ -252,7 +273,7 @@ t() { npm() { :; }; mknode 22.23.3; audit_node; };        case_ "22.23.3 = expos
 t() { npm() { :; }; mknode 20.19.0; audit_node; };        case_ "20.19.0 (end of life) = exposure" 'P=0 F=1' t
 t() { npm() { :; }; mknode 22.23.3; NODE_EXTRA_CA_CERTS="$FIX/aaa.pem" audit_node; }; case_ "unpatched + extra AAA = 2 exposures" 'F=2' t
 t() { npm() { :; }; mknode 24.22.1; NODE_OPTIONS="--require $T/evil.js" audit_node; tnote "replayed=$([ -e "$T/replayed" ] && echo yes || echo no)"; }
-case_ "NODE_OPTIONS loader never replayed" 'replayed=no' t
+case_ "NODE_OPTIONS loader never replayed" 'P=1 .*replayed=no' t
 t() { printf 'strict-ssl=false\n' > "$HOME/.npmrc"; audit_node; };                case_ ".npmrc strict-ssl=false = exposure" 'F=1' t
 t() { printf 'cafile=%s\n' "$FIX/aaa.pem" > "$HOME/.npmrc"; audit_node; };      case_ ".npmrc cafile -> AAA = exposure" 'F=1' t
 
