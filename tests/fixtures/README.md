@@ -15,3 +15,7 @@ How the tests use them:
 - **Java trust stores** follow Oracle's 2026-10-24 guidance (CVE-2026-114820): all four of these roots must be gone from `cacerts` (`comodoaaaca`, `emsignrootcag1`, `emsignrootcag2`, `emsigneccrootcag3`).
 
 Synthetic look-alikes (same name, different key), the cross-signed chain, and the private keys behind them are generated in temporary directories during a test run and never shipped.
+
+## trust-settings-system.txt
+
+Real `security dump-trust-settings -s | grep -B3 -A10 -Ei 'emsign|AAA Certificate'` output from a developer Mac (2026-10-26). It is Apple's built-in root list: every shipped root shows "Number of trust settings : 0". The tests use it to prove the script does not treat that list as an override.
