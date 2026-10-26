@@ -263,6 +263,35 @@ case_ "macOS check + system Ruby = one vendor item, no fail" 'F=0 D=1' t
 t() { cp "$FIX/aaa.pem" own.pem; MACOS_CERT_PEM="$T/none.pem"; mkruby "$T/own.pem"; PATH="$HOME/bin:$PATH" audit_other; }
 case_ "Ruby with its own bundle containing AAA = exposure" 'F=1 D=0' t
 
+section "macOS trust settings (parsed, not name-matched; system domain ignored)"
+# security stub: -s = real output captured on a Mac; -d / user = what each case writes.
+tsstub() { security() {
+  case "$*" in
+    "dump-trust-settings -s") cat "$FIX/trust-settings-system.txt" ;;
+    "dump-trust-settings -d") cat "$T/admin.txt" 2>/dev/null || { echo "SecTrustSettingsCopyCertificates: No Trust Settings were found." >&2; return 1; } ;;
+    "dump-trust-settings")    cat "$T/user.txt" 2>/dev/null || { echo "SecTrustSettingsCopyCertificates: No Trust Settings were found." >&2; return 1; } ;;
+    *) return 1 ;;
+  esac; }; MACOS_CERT_PEM="$FIX/emsign-g1.pem"; }
+export -f tsstub
+t() { tsstub; audit_macos; };  case_ "Apple's root list (-s, real Mac output) is not flagged" 'P=2 F=0 D=0 U=0' t
+t() { tsstub; printf 'Number of trusted certs = 1\nCert 0: emSign ECC Root CA - G3\n   Number of trust settings : 0\n' > admin.txt; audit_macos; }
+case_ "admin Always Trust on emSign ECC G3 = exposure" 'F=1' t
+t() { tsstub; printf 'Number of trusted certs = 1\nCert 0: AAA Certificate Services\n   Number of trust settings : 1\n   Trust Setting 0:\n      Policy OID            : SSL\n      Result Type           : kSecTrustSettingsResultDeny\n' > admin.txt; audit_macos; }
+case_ "admin Never Trust on AAA = fine" 'P=2 F=0 D=0 U=0' t
+t() { tsstub; printf 'Cert 0: AAA Certificate Services\n   Number of trust settings : 1\n   Trust Setting 0:\n      Policy OID            : SSL\n      Result Type           : kSecTrustSettingsResultTrustRoot\n' > admin.txt; audit_macos; }
+case_ "admin TrustRoot for SSL = exposure" 'F=1' t
+t() { tsstub; printf 'Cert 0: AAA Certificate Services\n   Number of trust settings : 1\n   Trust Setting 0:\n      Policy OID            : SSL\n' > admin.txt; audit_macos; }
+case_ "setting without Result Type (defaults to trust) = exposure" 'F=1' t
+t() { tsstub; printf 'Cert 0: emSign ECC Root CA - G3\r\n   Number of trust settings : 1\r\n   Trust Setting 0:\r\n      Result Type           : kSecTrustSettingsResultUnspecified\r\n' > admin.txt; audit_macos; }
+case_ "Unspecified (defers to system, CRLF) = fine" 'P=2 F=0 D=0 U=0' t
+t() { tsstub; printf 'Cert 0: Corp Internal Root CA\n   Number of trust settings : 0\nCert 1: emSign Root CA - G1\n   Number of trust settings : 0\n' > admin.txt; audit_macos; }
+case_ "unrelated or unaffected roots trusted = ignored" 'P=2 F=0 D=0 U=0' t
+t() { tsstub; printf 'Cert 0: emSign ECC Root CA - G3\n' > admin.txt; audit_macos; }
+case_ "unreadable setting = review" 'F=0 .*U=1' t
+t() { tsstub; printf 'Cert 0: AAA Certificate Services\n   Number of trust settings : 0\n' > user.txt; audit_env; }
+case_ "user Always Trust on AAA = exposure" 'F=1' t
+t() { tsstub; audit_env; };    case_ "no user trust settings = fine" 'P=1 F=0 .*U=0' t
+
 section "environment and shell files (bypasses, GIT_SSL_NO_VERIFY=false, PIP_TRUSTED_HOST)"
 t() { NODE_TLS_REJECT_UNAUTHORIZED=0 audit_env; };       case_ "NODE_TLS_REJECT_UNAUTHORIZED=0 = exposure" 'F=1' t
 t() { GIT_SSL_NO_VERIFY=false audit_env; };              case_ "GIT_SSL_NO_VERIFY=false = fine" 'F=0' t
