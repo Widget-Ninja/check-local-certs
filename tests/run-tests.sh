@@ -253,6 +253,16 @@ else NFAIL=$((NFAIL+1)); FAILED+=("cross-sign alternate path"); echo "FAIL  cros
 if ! xv "$FIX/emsign-g1.pem" intA.pem && ! xv "$FIX/emsign-g1.pem" intB.pem; then NPASS=$((NPASS+1)); echo "ok    both roots removed: neither path verifies"
 else NFAIL=$((NFAIL+1)); FAILED+=("cross-sign both removed"); echo "FAIL  no path should verify without either root"; fi
 
+section "macOS /etc/ssl/cert.pem (Apple fix pending) and Ruby"
+mkruby() { mkdir -p "$HOME/bin"; printf '#!/bin/bash\ncase "$*" in *DEFAULT_CERT_FILE*) printf %%s %q ;; *RUBY_VERSION*) printf 2.6.10 ;; esac\n' "$1" > "$HOME/bin/ruby"; chmod +x "$HOME/bin/ruby"; }
+export -f mkruby
+t() { cp "$FIX/aaa.pem" sys.pem; MACOS_CERT_PEM="$T/sys.pem"; ln -s "$T/sys.pem" link.pem; mkruby "$T/link.pem"; PATH="$HOME/bin:$PATH" audit_other; }
+case_ "system Ruby on Apple's bundle = waiting on Apple, not fix-now" 'F=0 D=1' t
+t() { cp "$FIX/aaa.pem" sys.pem; MACOS_CERT_PEM="$T/sys.pem"; audit_macos; mkruby "$T/sys.pem"; PATH="$HOME/bin:$PATH" audit_other; }
+case_ "macOS check + system Ruby = one vendor item, no fail" 'F=0 D=1' t
+t() { cp "$FIX/aaa.pem" own.pem; MACOS_CERT_PEM="$T/none.pem"; mkruby "$T/own.pem"; PATH="$HOME/bin:$PATH" audit_other; }
+case_ "Ruby with its own bundle containing AAA = exposure" 'F=1 D=0' t
+
 section "environment and shell files (bypasses, GIT_SSL_NO_VERIFY=false, PIP_TRUSTED_HOST)"
 t() { NODE_TLS_REJECT_UNAUTHORIZED=0 audit_env; };       case_ "NODE_TLS_REJECT_UNAUTHORIZED=0 = exposure" 'F=1' t
 t() { GIT_SSL_NO_VERIFY=false audit_env; };              case_ "GIT_SSL_NO_VERIFY=false = fine" 'F=0' t
