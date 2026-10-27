@@ -36,8 +36,11 @@
 #   - Then one pass per local user (UID >= 501 with a home folder), run AS that
 #     user with a clean environment, checks what that user owns: nvm/Homebrew/
 #     SDKMAN JDKs, Node, Python, Go, Homebrew bundles, ~/.npmrc, Git config.
-#   - Owner rule: a binary is only ever executed by the account that owns it.
-#     Root never runs user-writable binaries.
+#   - What root runs: only files that are owned by root, sit in folders owned by
+#     root that nobody else can write to, and (for a JDK, Python or Ruby) whose
+#     install folder holds nothing writable by others. Java's java and keytool are
+#     both checked. Apple's Python (Xcode) is never run as root. Anything root
+#     refuses is checked by the user passes, as that user.
 #   - remediate fixes Java only, unattended: for each JDK whose cacerts still
 #     trusts the four roots, it removes exactly those entries (Oracle's
 #     mitigation for JDKs that cannot be updated yet; the Oct 24 builds ship
@@ -91,7 +94,7 @@
 
 set -u
 shopt -s nullglob
-VERSION="3.1.2"
+VERSION="3.1.4"
 ORG_DIR="/Library/Application Support/emsign-check"
 STATUS_PLIST="$ORG_DIR/status.plist"
 LOGFILE="${EMSIGN_LOGFILE:-/var/log/emsign-check.log}"
@@ -236,10 +239,50 @@ rp() {
 # BSD stat (macOS) rejects -c; GNU stat accepts -f but means "filesystem", so try -c first.
 owner_of() { stat -c %U "$1" 2>/dev/null || stat -f %Su "$1" 2>/dev/null; }
 # mine PATH -> true if this pass may execute/inspect it (always true in dev mode)
+# root_safe FILE [TREE] -> 0 if root may run FILE: the resolved file and every folder
+# above it are owned by root and not writable by group or others, and (with TREE, a
+# runtime's install folder such as a JDK home or Python's lib) nothing inside TREE is
+# owned by another account or writable by group/others. Apple's sealed system volume
+# (/usr except /usr/local, /bin, /sbin, /System) is trusted as is. Sets ROOT_UNSAFE.
+uid_of()  { stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null; }
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null; }
+root_only() { local m; [ "$(uid_of "$1")" = 0 ] || return 1; m=$(mode_of "$1"); [ -n "$m" ] && [ $(( 8#$m & 022 )) -eq 0 ]; }
+root_safe() {
+  local f d t="${2:-}" bad
+  ROOT_UNSAFE=""
+  f=$(rp "$1") || { ROOT_UNSAFE="$1 (unresolvable)"; return 1; }
+  case "$f" in /usr/local/*) ;; /usr/*|/bin/*|/sbin/*|/System/*) return 0 ;; esac
+  d=$f
+  while :; do
+    root_only "$d" || { ROOT_UNSAFE=$d; return 1; }
+    [ "$d" = / ] && break
+    d=$(dirname "$d")
+  done
+  if [ -n "$t" ] && [ -d "$t" ]; then
+    bad=$(find "$(rp "$t")" ! -type l \( ! -user 0 -o -perm -0020 -o -perm -0002 \) -print 2>/dev/null | head -1)
+    [ -z "$bad" ] || { ROOT_UNSAFE=$bad; return 1; }
+  fi
+  return 0
+}
+
+# mine FILE [TREE] -> may this pass run FILE?
+#   developer run: yes (everything runs as you anyway)
+#   root (system pass): only if root_safe; anything else is left to the user passes
+#   user pass: files this account owns, plus root-owned files root refuses to run
+#     (e.g. a pkg-installed node in a user-writable /usr/local/bin), so nothing is skipped
 mine() {
   [ $OWNER_FILTER -eq 0 ] && return 0
   local o; o=$(owner_of "$(rp "$1")")
+  if [ "$(id -u)" -eq 0 ]; then
+    [ "$o" = root ] && root_safe "$1" "${2:-}" && return 0
+    if [ "$o" = root ]; then dbg "root will not run $1: $ROOT_UNSAFE is not root-only; left to user passes"
+    else dbg "skip $1: owned by ${o:-unknown}, checked in that account's pass"; fi
+    return 1
+  fi
   [ "$o" = "$ME" ] && return 0
+  if [ "$o" = root ] && ! root_safe "$1" "${2:-}"; then
+    dbg "checking $1 as $ME: root will not run it ($ROOT_UNSAFE is not root-only)"; return 0
+  fi
   dbg "skip $1: owned by ${o:-unknown}, checked in that account's pass"
   return 1
 }
@@ -292,6 +335,28 @@ SUSPECT_RE='CN *= *(emSign (ECC Root CA|Root TLS CA|Root CS CA) - G3|AAA Certifi
 # article 149555); Apple documents an optional manual edit for admins until then.
 MACOS_CERT_PEM=/etc/ssl/cert.pem
 MACOS_CERT_FIX="Waits on a macOS update (Apple support 149555). Until then admins may remove emSign ECC Root CA - G3 (and optionally AAA Certificate Services) from /etc/ssl/cert.pem as Apple describes; prefer Homebrew curl/git/python meanwhile"
+# Apple's Python: /usr/bin/python3 and the copies inside Xcode or the Command Line
+# Tools. Its pip/certifi live inside Xcode; changing them breaks Xcode's signature
+# and is undone by the next update, so they wait on Apple.
+APPLE_PY_FIX="Waits on an Xcode / Command Line Tools update; do not modify files inside Xcode. Use Homebrew or uv Python for your own work"
+APPLE_PY_PREFIXES="/usr/bin/ /Library/Developer/CommandLineTools/ /Applications/Xcode"
+is_apple_python() {
+  local r x; r=$(rp "$1")
+  for x in $APPLE_PY_PREFIXES; do
+    case "$1" in "$x"*) return 0 ;; esac
+    case "$r" in "$x"*) return 0 ;; esac
+  done
+  return 1
+}
+# True when FILE is macOS's own /etc/ssl/cert.pem (any path that resolves to it).
+is_macos_bundle() { [ -e "$MACOS_CERT_PEM" ] && [ "$(rp "$1")" = "$(rp "$MACOS_CERT_PEM")" ]; }
+# check_default_bundle FILE LABEL FIX ALTERNATIVE: a tool's built-in default CA file.
+# Apple's /etc/ssl/cert.pem gets the same verdict wherever a tool uses it (waits on
+# Apple); any other default file is a normal finding with FIX.
+check_default_bundle() {
+  if is_macos_bundle "$1"; then check_bundle "$1" "$2 (uses macOS /etc/ssl/cert.pem)" pend "$MACOS_CERT_FIX; or use $4"
+  else check_bundle "$1" "$2" fail "$3"; fi
+}
 if [ -x /usr/bin/openssl ]; then OPENSSL=/usr/bin/openssl; else OPENSSL=$(command -v openssl 2>/dev/null || echo openssl); fi
 
 key_class() {   # key_class SPKI SUBJECT
@@ -561,7 +626,9 @@ queue_brew() { case " $BREW_PKGS " in *" $1 "*) ;; *) BREW_PKGS="${BREW_PKGS:+$B
 # probe* run an installed runtime from / with stdin closed, a time limit, and the
 # environment variables that would make it load extra code or settings removed.
 probe()      { local t=$1; shift; ( cd / && run_t "$t" "$@" ) </dev/null; }
-probe_java() { local t=$1; shift; probe "$t" env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS "$@"; }
+# JAVA_HOME is dropped too: a real JDK binary ignores it, but macOS's launcher stubs
+# follow it and could re-enter the stub from a JDK whose bin/ links to /usr/bin.
+probe_java() { local t=$1; shift; probe "$t" env -u JAVA_HOME -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS "$@"; }
 probe_node() { local t=$1; shift; probe "$t" env -u NODE_OPTIONS -u NODE_PATH "$@"; }
 probe_go()   { local t=$1; shift; probe "$t" env GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off GOWORK=off GOENV=off GOFLAGS= "$@"; }
 probe_ruby() { local t=$1; shift; probe "$t" env -u RUBYOPT -u RUBYLIB "$@"; }
@@ -661,6 +728,7 @@ audit_env() {
     [ -n "${NODE_OPTIONS:-}" ] && info "NODE_OPTIONS=$NODE_OPTIONS"
   else
     dbg "user pass runs with a clean environment; checking shell startup files instead of live variables"
+    NOT_COVERED+=("Jamf runs do not load shell profiles: CA settings exported there (SSL_CERT_FILE, REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS, JAVA_TOOL_OPTIONS, npm/Yarn env) are only checked when the developer runs the script")
   fi
   for rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.profile"; do
     [ -f "$rc" ] || continue
@@ -754,20 +822,21 @@ audit_java() {
             /Library/Java/JavaVirtualMachines/*/Contents/Home \
             /opt/homebrew/opt/openjdk*/libexec/openjdk.jdk/Contents/Home \
             /usr/local/opt/openjdk*/libexec/openjdk.jdk/Contents/Home \
-            /Applications/IntelliJ*.app/Contents/jbr/Contents/Home \
-            /Applications/Android\ Studio*.app/Contents/jbr/Contents/Home \
-            "$HOME"/Applications/IntelliJ*.app/Contents/jbr/Contents/Home \
-            "$HOME"/Applications/Android\ Studio*.app/Contents/jbr/Contents/Home; do
+            "$HOME"/.gradle/jdks/* "$HOME"/.gradle/jdks/*/Contents/Home "$HOME"/.gradle/jdks/*/*/Contents/Home \
+            /Applications/*.app/Contents/jbr/Contents/Home \
+            "$HOME"/Applications/*.app/Contents/jbr/Contents/Home \
+            "$HOME"/Library/Application\ Support/JetBrains/Toolbox/apps/*/*/*/*.app/Contents/jbr/Contents/Home; do
     [ -n "$jh" ] && [ -x "$jh/bin/keytool" ] || continue
     case "$jh" in */current) continue ;; esac
     r=$(rp "$jh"); seen "jdk:$r" && continue
-    mine "$jh/bin/keytool" || continue
+    # Both programs this check runs, and the JDK home they load code from.
+    mine "$jh/bin/keytool" "$jh" && mine "$jh/bin/java" || continue
     found=1; anykt="$jh/bin/keytool"
     jv=$(probe_java 30 "$jh/bin/java" -version 2>&1 | grep -v "^Picked up" | head -1 | tr -d '\r')
     dbg "JDK $jh -> $r [$jv] owner=$(owner_of "$r/bin/keytool")"
     ks="$jh/lib/security/cacerts"; [ -f "$ks" ] || ks="$jh/jre/lib/security/cacerts"
     bc=$(jdk_blocklist_path "$jh")
-    ide=0; case "$jh" in /Applications/*.app/*|"$HOME"/Applications/*.app/*) ide=1 ;; esac
+    ide=0; case "$jh" in *.app/Contents/*) ide=1 ;; esac   # any app-bundled runtime (all JetBrains IDEs, Android Studio, Toolbox installs)
     # blocked.certs is context only now: it tells whether the Oct 21 fix landed.
     miss=$(bl_missing "$bc")
     case "$miss" in
@@ -827,36 +896,51 @@ try:
 except Exception: pass'
 audit_python() {
   hdr "Python"
-  local pys py r pv out caf cline cv cw pline pipv pipw found=0
+  local pys py r pv out caf cline cv cw pline pipv pipw apple found=0
   pys="$(command -v python3 2>/dev/null)"
   # /usr/bin/python3 is a stub that pops an install dialog without the Command Line Tools
   xcode-select -p >/dev/null 2>&1 || pys=$(printf '%s' "$pys" | grep -v '^/usr/bin/python3$')
   for py in $pys /opt/homebrew/bin/python3* /usr/local/bin/python3* \
             /Library/Frameworks/Python.framework/Versions/*/bin/python3 \
-            "$HOME"/.pyenv/versions/*/bin/python3 "$HOME"/.asdf/installs/python/*/bin/python3; do
+            "$HOME"/.pyenv/versions/*/bin/python3 "$HOME"/.asdf/installs/python/*/bin/python3 \
+            "$HOME"/.local/share/uv/python/*/bin/python3; do
     case "$py" in *-config) continue ;; esac
     [ -x "$py" ] || continue
     r=$(rp "$py"); seen "py:$r" && continue
-    mine "$py" || continue
+    # Apple's Python (/usr/bin/python3 -> Xcode or the Command Line Tools) runs code
+    # from inside Xcode, which root does not vet: only user passes and developers run it.
+    apple=0; is_apple_python "$py" && apple=1
+    if [ $apple -eq 1 ]; then
+      [ "$(id -u)" -eq 0 ] && [ "$ROLE" != dev ] && { dbg "root does not run Apple's Python ($py); user passes check it"; continue; }
+    else
+      mine "$py" "$(dirname "$r")/../lib" || continue
+    fi
     found=1
     pv=$(probe 20 "$py" -I -V 2>&1)
     out=$(probe 30 "$py" -I -c "$PY_JS" 2>/dev/null)
     dbg "python $py -> $r [$pv]: $(printf '%s' "$out" | tr '\n' ' ')"
     caf=$(printf '%s\n' "$out" | grep '^cafile|' | cut -d'|' -f2)
-    [ -n "$caf" ] && [ -f "$caf" ] && check_bundle "$caf" "$pv ssl default"
+    [ -n "$caf" ] && [ -f "$caf" ] && check_default_bundle "$caf" "$pv ssl default" \
+      "Update the Python or OpenSSL package that owns this file (Homebrew: brew upgrade ca-certificates)" "Homebrew Python"
     cline=$(printf '%s\n' "$out" | grep '^certifi|')
     if [ -n "$cline" ]; then
       cv=$(echo "$cline" | cut -d'|' -f2); cw=$(echo "$cline" | cut -d'|' -f3)
       info "$pv ($py): certifi $cv (fixed in 2026.10.19)"
-      check_bundle "$cw" "$pv certifi $cv" fail "$py -m pip install -U certifi (2026.10.19 or later)"
-      [ "$LAST_BUNDLE_AFFECTED" -eq 1 ] && CERTIFI_FIX+=("$py")
+      if [ $apple -eq 1 ]; then check_bundle "$cw" "$pv certifi $cv (Apple's Python)" pend "$APPLE_PY_FIX"
+      else
+        check_bundle "$cw" "$pv certifi $cv" fail "$py -m pip install -U certifi (2026.10.19 or later)"
+        [ "$LAST_BUNDLE_AFFECTED" -eq 1 ] && CERTIFI_FIX+=("$py")
+      fi
     fi
     # pip always adds its vendored certifi to the system store; only pip 26.2.2+ is clean.
     pline=$(printf '%s\n' "$out" | grep '^pip|')
     if [ -n "$pline" ]; then
       pipv=$(echo "$pline" | cut -d'|' -f2); pipw=$(echo "$pline" | cut -d'|' -f3)
-      check_bundle "$pipw" "$pv pip $pipv vendored certifi" fail "$py -m pip install -U pip (26.2.2 or later; Homebrew Python: brew upgrade python)"
-      [ "$LAST_BUNDLE_AFFECTED" -eq 1 ] && PIP_FIX+=("$py|$pipv")
+      if [ $apple -eq 1 ]; then check_bundle "$pipw" "$pv pip $pipv vendored certifi (Apple's Python, inside Xcode or the Command Line Tools)" pend "$APPLE_PY_FIX"
+      else
+        check_bundle "$pipw" "$pv pip $pipv vendored certifi" fail "$py -m pip install -U pip (26.2.2 or later; Homebrew Python: brew upgrade python; uv Pythons: uv python upgrade)"
+        [ "$LAST_BUNDLE_AFFECTED" -eq 1 ] && PIP_FIX+=("$py|$pipv")
+      fi
     else
       dbg "$pv: no pip, or pip without a vendored certifi (distro-patched)"
     fi
@@ -876,9 +960,11 @@ audit_uv() {
     found=1
     v=$(probe 10 "$u" --version 2>/dev/null | awk '{print $2}')
     dbg "uv $u -> $r version=${v:-unknown}"
-    if [ -n "$v" ] && ver_ge "$v" 0.13.4; then ok "uv $v ($u): embedded roots updated"
+    # 0.13.4 only dropped the emSign root; 0.13.5 adds the key-based block (rustls-webpki
+    # 0.103.16) that also stops the AAA cross-signed path, and updates uv's managed Pythons.
+    if [ -n "$v" ] && ver_ge "$v" 0.13.5; then ok "uv $v ($u): rejects the compromised keys"
     else
-      fail "uv ${v:-unknown} ($u): embedded roots trust the compromised CAs" "uv self update (0.13.4 or later; Homebrew: brew upgrade uv)"
+      fail "uv ${v:-unknown} ($u): embedded roots trust the compromised CAs" "uv self update (0.13.5 or later; Homebrew: brew upgrade uv), then uv python upgrade"
       case "$r" in /opt/homebrew/*|/usr/local/Cellar/*) queue_brew uv ;; *) UV_FIX+=("$u|${v:-unknown}") ;; esac
     fi
   done
@@ -975,20 +1061,17 @@ audit_git() {
   return 0
 }
 
-# True when FILE is macOS's own /etc/ssl/cert.pem (any path that resolves to it).
-is_macos_bundle() { [ -e "$MACOS_CERT_PEM" ] && [ "$(rp "$1")" = "$(rp "$MACOS_CERT_PEM")" ]; }
 
 audit_other() {
   hdr "Other runtimes"
   local rb cf rv
   rb=$(command -v ruby 2>/dev/null)
-  if [ -n "$rb" ] && mine "$rb"; then
+  if [ -n "$rb" ] && mine "$rb" "$(dirname "$(rp "$rb")")/../lib"; then
     cf=$(probe_ruby 20 "$rb" -ropenssl -e 'print OpenSSL::X509::DEFAULT_CERT_FILE' 2>/dev/null)
     rv=$(probe_ruby 10 "$rb" -e 'print RUBY_VERSION' 2>/dev/null)
     if [ -n "$cf" ] && [ -f "$cf" ]; then
       # System Ruby reads Apple's bundle: same file, same verdict as the macOS check (waits on Apple).
-      if is_macos_bundle "$cf"; then check_bundle "$cf" "ruby $rv (uses macOS /etc/ssl/cert.pem)" pend "$MACOS_CERT_FIX; or use Homebrew Ruby"
-      else check_bundle "$cf" "ruby $rv" fail "Update the bundle Ruby uses (Homebrew: brew upgrade ca-certificates)"; fi
+      check_default_bundle "$cf" "ruby $rv" "Update the bundle Ruby uses (Homebrew: brew upgrade ca-certificates)" "Homebrew Ruby"
     fi
   fi
   [ "$ROLE" = dev ] || return 0
@@ -1120,7 +1203,7 @@ ks_remove_roots() {
   # read -a: no pathname expansion ("[jdk]" is a glob and nullglob is on)
   IFS=';' read -r -a al_list <<< "$aliases"
   for al in "${al_list[@]}"; do
-    if ! $SUDO env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS "$kt" -delete -keystore "$stage" \
+    if ! $SUDO env -u JAVA_HOME -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS "$kt" -delete -keystore "$stage" \
          -storepass changeit -alias "$al" </dev/null >/dev/null 2>&1; then
       $SUDO rm -f "$stage"; KS_TX_ERR="keytool could not delete '$al' from the staged copy; $ks unchanged (backup $bak)"; return 1
     fi
@@ -1297,7 +1380,7 @@ record_dev_actions() {
     for e in "${PIP_FIX[@]}"; do restate "${e%%|*}: pip ${e#*|} -> python -m pip install -U pip (>= 26.2.2; Homebrew Python: brew upgrade python)"; done
   fi
   if [ ${#UV_FIX[@]} -gt 0 ]; then
-    for e in "${UV_FIX[@]}"; do restate "${e%%|*}: uv ${e#*|} -> uv self update (>= 0.13.4)"; done
+    for e in "${UV_FIX[@]}"; do restate "${e%%|*}: uv ${e#*|} -> uv self update (>= 0.13.5)"; done
   fi
   return 0
 }
@@ -1358,7 +1441,7 @@ run_pass() {
     [ ${#JDK_FIX[@]} -gt 0 ]     && say "  - Java: ${#JDK_FIX[@]} JDK(s) still trust the distrusted roots (removed from cacerts, with a backup)"
     [ ${#PIP_FIX[@]} -gt 0 ]     && say "  - pip: ${#PIP_FIX[@]} interpreter(s) below 26.2.2"
     [ ${#CERTIFI_FIX[@]} -gt 0 ] && say "  - Python: certifi in ${#CERTIFI_FIX[@]} interpreter(s)"
-    [ ${#UV_FIX[@]} -gt 0 ]      && say "  - uv: ${#UV_FIX[@]} install(s) below 0.13.4"
+    [ ${#UV_FIX[@]} -gt 0 ]      && say "  - uv: ${#UV_FIX[@]} install(s) below 0.13.5"
     say ""
     ask any "Proceed to remediation? Each fix is confirmed separately." || { say "  No changes made."; return 0; }
   fi
@@ -1629,8 +1712,8 @@ if mkdir -p "$ORG_DIR" 2>/dev/null; then
     plist_int Fixed "$AGG_FIXED"; plist_int Errors "$AGG_ERR"
     plist_str Users "${USERS_SCANNED:-}"
     plist_str UsersIncomplete "${USERS_FAILED:-}"
-    plist_str Failures "$(printf '%s' "${fails_text% }" | cut -c1-4000)"
-    plist_str Actions "$(printf '%s' "${acts_text% }" | cut -c1-4000)"
+    plist_str Failures "${fails_text% }"
+    plist_str Actions "${acts_text% }"
     plist_int DurationSeconds "$DURATION"
     echo '</dict></plist>'
   } > "$tmpp"

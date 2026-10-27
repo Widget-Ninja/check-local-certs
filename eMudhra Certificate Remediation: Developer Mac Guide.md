@@ -1,6 +1,8 @@
 # eMudhra Certificate Remediation: Developer Mac Guide
 
-Oct 26, 2026 · @Lucas · for `jamf-emsign.sh` v3.1.0
+Oct 27, 2026 · @Lucas
+
+**Guide v3.1.4**, for `jamf-emsign.sh` **v3.1.4**. Check your copy with `grep '^VERSION=' jamf-emsign.sh`; if it differs, get the matching script or guide from [jamf-emsign-v3.1.4](https://github.com/Widget-Ninja/check-local-certs/tree/main).
 
 ## What happened
 
@@ -9,11 +11,11 @@ Every developer Mac needs its Node, Java and Python trust stores updated this we
 Safari, Chrome and Firefox blocked the certificates within days. Command-line tools and language runtimes carry their own copy of trusted roots and do not check revocation, so they still trust forged certificates until updated:
 
 - **Node.js** (npm, Yarn): fixed releases shipped 21 October.
-- **Java**: every JDK, including the ones bundled inside IntelliJ and Android Studio.
+- **Java**: every JDK, including Gradle toolchain JDKs and the runtimes bundled inside JetBrains IDEs and Android Studio.
 - **Python**: pip (its own built-in certificate list), certifi in each virtualenv, and Homebrew's CA bundle.
 - **uv**, **Go** (1.26.10 / 1.27.3; rebuild binaries you ship) and any file-based CA bundle.
 
-The compromised intermediates chain to **emSign ECC Root CA - G3** and, through Sectigo cross-signs, to **AAA Certificate Services**. The script recognizes these certificates by their public keys, not their names, so a renamed copy is still caught. The other emSign roots (G1, C1, ECC C3) are not affected.
+The compromised intermediates chain to **emSign ECC Root CA - G3** and, through Sectigo cross-signs, to **AAA Certificate Services**. The script recognizes certificates by their public keys, not their names, so a renamed copy is still caught. For Java, Oracle went further on 24 October and also removed **emSign Root CA - G1** and **G2** from the JDK (section 3); in other CA files, G1, C1 and ECC C3 are not affected.
 
 Fix time: about 20–30 minutes per machine.
 
@@ -27,23 +29,23 @@ chmod +x jamf-emsign.sh
 ./jamf-emsign.sh                 # audit, then offer fixes (asks before each one)
 ./jamf-emsign.sh --audit-only    # report only, change nothing
 ./jamf-emsign.sh --deep          # also scan virtualenvs and app-bundled CA files
-./jamf-emsign.sh --help          # every option
 ```
 
-- Answer **y** to "Proceed to remediation?", then y or n to each fix. Java's `cacerts` is backed up as `cacerts.emsign-bak-<timestamp>` before any change.
-- `--yes` approves the routine fixes without prompting, including the Java root removal. Uninstalling old Node versions still needs your interactive answer (or `--yes --allow-destructive`).
+- Nothing to download: the certificate identities the script checks are built in.
+- Answer **y** to "Proceed to remediation?", then y or n to each fix. A JDK's `cacerts` is backed up as `cacerts.emsign-bak-<timestamp>` before any change.
+- `--yes` approves the fixes, including Java root removal. Removing old Node versions still needs your interactive answer (or `--allow-destructive`).
 - Run it from any folder; npm and Yarn are never started inside your projects, so a pinned package manager cannot stall it.
 
 The run ends with a **SUMMARY** block: a STATUS line, then **Fix now** (each item with its fix), **Waiting on a vendor**, and **Review**.
 
-| STATUS | Exit code | What it means for you |
+| STATUS | Exit code (your run) | What it means for you |
 | --- | --- | --- |
 | PROTECTED | 0 | Done |
 | VENDOR\_PENDING | 1 | Done for now; what is left waits on Apple or an IDE vendor |
 | EXPOSED | 2 | Work through **Fix now** |
-| UNVERIFIED | 3 | Something could not be checked; follow **Review**, or send the summary to \<CONTACT> |
+| UNVERIFIED | 3 | Something could not be checked; follow **Review**, or send the summary to \<Support Team> |
 
-WARN lines are advisories and never change the status. "Not covered" lists what the script cannot check; it is not counted.
+WARN lines are advisories and never change the status. "Not covered" lists what the script cannot check; it is not counted. A Jamf run uses the same STATUS names but different exit codes (see the maintainers section).
 
 ## 2. Node.js, npm and Yarn
 
@@ -67,7 +69,7 @@ nvm uninstall 24.16.0                     # repeat for each old version the audi
 node --version                            # confirm
 ```
 
-With Homebrew: `brew upgrade node` (or `node@22`). With Volta: `volta install node@24`.
+With Homebrew: `brew upgrade node` (or `node@24 or node@26`).
 
 **If you set** `NODE_OPTIONS=--use-system-ca`: Node versions before 22.15 refuse to start with it, so remove those versions. The flag also pulls in macOS's roots, and Apple's revocation does not protect Node, so the upgrade is still required.
 
@@ -77,19 +79,17 @@ After upgrading, delete and reinstall `node_modules` only if a project pins an `
 
 ## 3. Java (JDK 21 and any other JDK)
 
-Oracle changed its guidance on 24 October (CVE-2026-114820, JDK-8395690): the 21 October blocklist builds are now listed as affected. A JDK is fixed only when its `cacerts` no longer trusts the four roots Oracle removed: **emSign ECC Root CA - G3**, **emSign Root CA - G1**, **emSign Root CA - G2** and **AAA Certificate Services** (aliases `emsigneccrootcag3`, `emsignrootcag1`, `emsignrootcag2`, `comodoaaaca`). The script matches them by key, so a renamed copy is still found, and reports `blocked.certs` for context only.
+A JDK is fixed when its `cacerts` no longer trusts the four roots Oracle removed on 24 October (CVE-2026-114820): **emSign ECC Root CA - G3**, **emSign Root CA - G1**, **emSign Root CA - G2** and **AAA Certificate Services**. The script matches them by key. Oracle now lists the 21 October builds, which only added a blocklist, as affected, so a complete blocklist no longer passes on its own; the script still shows it for context.
 
 Fix in this order:
 
-1. **Install a fixed JDK** where your vendor has one: 8u511-b33, 11.0.33.0.3, 17.0.21.0.3, 21.0.13.0.3, 25.0.5.0.3 or 27.0.1.0.3, or a vendor build that includes JDK-8395690.
-2. **Otherwise let the script remove the four roots**, which is what the fixed builds ship. Answer y to "Remove … distrusted root(s)". It keeps a verified backup (`cacerts.emsign-bak-<timestamp>`), edits a staged copy, verifies it and only then swaps it in. Only entries with those exact keys are removed; a same-named entry with another key goes to Review instead. Then restart running Java processes and Gradle daemons: `./gradlew --stop`.
-3. **Optionally add revocation checking:** `-Dcom.sun.net.ssl.checkRevocation=true -Dcom.sun.security.enableCRLDP=true` in `JAVA_TOOL_OPTIONS`. Test it first; connections fail where CRL endpoints are unreachable.
+1. **Install a fixed JDK** where your vendor has one: Oracle 8u511-b33, 11.0.33.0.3, 17.0.21.0.3, 21.0.13.0.3, 25.0.5.0.3 or 27.0.1.0.3, or any vendor build that includes JDK-8395690. Corretto 21.0.13.0.10 shipped before this change, so it still needs step 2.
+2. **Otherwise let the script remove the four roots.** Answer y to "Remove … distrusted root(s)". It removes only the entries whose key matches, keeps a verified backup next to `cacerts`, edits a copy, checks the copy, and only then swaps it in. Then restart Gradle daemons: `./gradlew --stop`. To undo, copy the backup over `cacerts`.
+3. **Revocation checking** is Oracle's other option: `-Dcom.sun.net.ssl.checkRevocation=true -Dcom.sun.security.enableCRLDP=true` in `JAVA_TOOL_OPTIONS`. The script notes it but does not count it as the fix, because it only covers processes that inherit the variable. Test it first; connections fail where CRL endpoints are unreachable.
 
-A JDK update installs a fresh `cacerts` with the roots back in, so re-run the script after each one until you are on a fixed build.
+A JDK update installs a fresh `cacerts`, so re-run the script after each update until you are on a fixed build.
 
-To undo a removal, copy the backup back over `cacerts` (for example `cp -p cacerts.emsign-bak-<timestamp> cacerts` in that JDK's `lib/security`).
-
-**JDKs inside IntelliJ or Android Studio** show under "Waiting on a vendor". Do not edit files inside the `.app` bundle (that breaks its signature). Set **Settings → Build Tools → Gradle → Gradle JVM** to a fixed JDK, and update the IDE when its vendor ships a new runtime. The script also checks the JDK named by `org.gradle.java.home` in `~/.gradle/gradle.properties`; commented-out lines are ignored.
+**Runtimes inside JetBrains IDEs** (IntelliJ, PyCharm, GoLand and the rest, including Toolbox installs) **or Android Studio** show under "Waiting on a vendor". Do not edit files inside the `.app` bundle (that breaks its signature). Set **Settings → Build Tools → Gradle → Gradle JVM** to a fixed JDK, and update the IDE when its vendor ships a new runtime. The script also checks Gradle toolchain JDKs in `~/.gradle/jdks` and the JDK named by `org.gradle.java.home` in `~/.gradle/gradle.properties`; commented-out lines are ignored.
 
 ## 4. Python, uv, Homebrew, Go and the rest
 
@@ -97,13 +97,15 @@ Most of these are one command each; the macOS system bundle is the exception and
 
 | Summary item | Fix |
 | --- | --- |
-| pip vendored certifi (pip 26.2.1 or older) | `python -m pip install -U pip` in that interpreter or virtualenv (Homebrew Python: `brew upgrade python`). pip always trusts its own copy, so this matters even with certifi updated. |
+| pip vendored certifi (pip 26.2.1 or older) | `python -m pip install -U pip` in that interpreter or virtualenv (Homebrew Python: `brew upgrade python`; uv-managed Python: `uv python upgrade`). pip always trusts its own copy, so this matters even with certifi updated. |
 | Python `certifi` (older than 2026.10.19) | `python -m pip install -U certifi` in each virtualenv; pipx tools: `pipx upgrade-all` |
-| uv older than 0.13.4 | `uv self update` (Homebrew: `brew upgrade uv`) |
+| pip or certifi in Apple's Python (/usr/bin/python3, Xcode, Command Line Tools) (Waiting on a vendor) | Waits on an Xcode or Command Line Tools update. Do not change files inside Xcode (it breaks its signature and the next update undoes it). Use Homebrew or uv Python for your own work. |
+| uv older than 0.13.5 | `uv self update` (Homebrew: `brew upgrade uv`), then `uv python upgrade` for the Pythons uv installed. 0.13.4 only dropped the emSign root; 0.13.5 also blocks the AAA cross-signed path. |
 | Homebrew bundle (`/opt/homebrew/etc/ca-certificates/cert.pem`) | `brew update && brew upgrade ca-certificates`, as the account that owns Homebrew |
 | Go older than 1.26.10 / 1.27.3 | `brew upgrade go`, then rebuild Go binaries you ship to Linux or containers |
 | Go binary in `~/go/bin` built with an old Go (advisory) | Rebuild it if it ships to Linux or uses its own root list; on macOS, Go uses Apple's verification |
-| `/etc/ssl/cert.pem` (Waiting on a vendor) | Cannot be edited (System Integrity Protection). Install the next macOS update; until then prefer Homebrew `curl` over `/usr/bin/curl` |
+| `/etc/ssl/cert.pem`, also reported for Apple's built-in Python and Ruby (Waiting on a vendor) | Apple will fix it in a future macOS update (no date yet). Until then prefer Homebrew `curl`, `git`, Python and Ruby over the system ones. Apple documents an optional manual edit for admins (remove emSign ECC Root CA - G3, optionally AAA, from the file); a macOS update can undo it, and tools using only this file may then fail on some sites. |
+| Admin or user trust settings: an emSign or AAA certificate marked trusted | Keychain Access → find the certificate named in the summary → Trust → Use System Defaults. If a configuration profile set it, ask \<CONTACT> to remove that profile instead. |
 
 **Before running `brew upgrade`:** it also upgrades or removes other formulae. In testing, `brew upgrade ca-certificates node@24` also installed `openssl@4`, uninstalled `python@3.13`, and upgraded `awscli` and `gnupg`. Run `brew upgrade --dry-run <formula>` first and check that nothing you depend on is removed.
 
@@ -111,50 +113,30 @@ Not checked by the script (listed under "Not covered"): Rust projects (`webpki-r
 
 ## 5. Verify and report back
 
-You are done when the summary says **STATUS: PROTECTED**, or **STATUS: VENDOR\_PENDING** with only `/etc/ssl/cert.pem` (waits on Apple) and IDE-bundled runtimes (wait on JetBrains or Google) under "Waiting on a vendor".
+You are done when the summary says **STATUS: PROTECTED**, or **STATUS: VENDOR\_PENDING** with only these under "Waiting on a vendor": `/etc/ssl/cert.pem` and Apple's Python (wait on Apple), and IDE-bundled runtimes (wait on JetBrains or Google).
 
 - [ ] Re-run `./jamf-emsign.sh --audit-only` and confirm "Fix now" is empty
-- [ ] Post the STATUS line and counts from the summary to \<CHANNEL OR TICKET> by \<DEADLINE>
 - [ ] Re-run after any `brew upgrade`, JDK install or new Node version until your vendors ship fixed builds
 
 ## For maintainers: the Jamf policy
 
-The same `jamf-emsign.sh` runs as a Jamf policy script. As root, it does a system pass and then one pass per local user, each run as that user, so every account's Node, JDKs and Python are covered. Root never runs a program a user owns, and in remediate mode only Java is changed unattended: the four distrusted roots are removed from each unpatched JDK's `cacerts`, with a verified backup. IDE-bundled JDKs are never edited.
+The same `jamf-emsign.sh` runs as a Jamf policy script. As root, it does a system pass and then one pass per local user, each run as that user, so every account's Node, JDKs and Python are covered. Root only runs a program that is owned by root, sits in folders only root can write to, and (for a JDK, Python or Ruby) has nothing writable by others inside its install folder; for a JDK both `java` and `keytool` are checked. Apple's Python is never run as root. Anything root refuses is checked by the user passes instead. In remediate mode only Java is changed unattended.
 
 | Parameter | Purpose | Default |
 | --- | --- | --- |
 | $4 | `audit` or `remediate` | audit |
-| $5 | Verbose log (`1`/`0`) | 1 |
+| $5 | Verbose log (1/0) | 1 |
 | $6 | Mark the policy failed when EXPOSED or UNVERIFIED | yes |
 | $7 | Run `jamf recon` afterwards | no |
 | $8 | Scan `all` users or only the `console` user | all |
 
-1. Add `jamf-emsign.sh` under **Settings → Computer management → Scripts** and label $4–$8 as above.
-2. Add the extension attribute from the script header (also in `README.md`). It reads `/Library/Application Support/emsign-check/status.plist`, so inventory updates do not rescan. Build smart groups on EXPOSED and UNVERIFIED.
-3. Test on one Mac first; `sudo` takes the same code path as Jamf:
+1. Test on one Mac first: `sudo ./jamf-emsign.sh / "$(hostname)" "$USER" audit 1 no no console`.
+2. Roll out in **audit** mode. Each run writes `/Library/Application Support/emsign-check/status.plist`; the extension attribute in the script header reads it, so inventory updates do not rescan. Build smart groups on EXPOSED and UNVERIFIED.
+3. Switch $4 to **remediate** to fix Java fleet-wide: each JDK that still trusts the four roots has exactly those entries removed, with a verified backup next to its `cacerts`. Node, Homebrew, pip and uv stay with developers (downloads and brew side effects); they appear under "Fix now" in each Mac's log and in the status file.
 
-   ```bash
-   sudo ./jamf-emsign.sh / "$(hostname)" "$USER" audit
-   sudo ./jamf-emsign.sh / "$(hostname)" "$USER" remediate 1 no no console
-   sudo ./jamf-emsign.sh --mode=audit --verbose --users=console   # same, with flags
-   ```
-4. Roll out in **audit** mode; nothing changes, and each Mac's log and status file list what remediate would do.
-5. Switch $4 to **remediate** to fix Java fleet-wide. Node, Homebrew, pip and uv stay with developers (downloads and brew side effects); they appear under "Fix now" in each Mac's log and in the status file. Keep the policy recurring: JDK updates restore the old `cacerts` until each Mac has a fixed build.
+Exit codes of a Jamf run: **0** = PROTECTED or VENDOR\_PENDING; **1** = EXPOSED or UNVERIFIED when $6 is yes (with no, these also exit 0); **2** = bad parameters or the script could not run. Developer runs use 0–3 (section 1). The status file keeps the full Failures and Actions lists.
 
-Exit codes in Jamf: 0 for PROTECTED or VENDOR_PENDING; 1 for EXPOSED or UNVERIFIED when $6 is `yes`; 2 for bad parameters or when the script could not run.
-
-Limits: Jamf runs do not load shell profiles, so variables a developer exports there (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `JAVA_HOME`) are only seen when developers run the script themselves. Logs: the policy log and `/var/log/emsign-check.log`.
-
-## For maintainers: running the tests
-
-Run the test suite after any change to the script and before uploading a new version to Jamf:
-
-```bash
-tests/run-tests.sh                         # tests ./jamf-emsign.sh
-tests/run-tests.sh path/to/jamf-emsign.sh  # tests another copy
-```
-
-It needs bash, `openssl` and `perl`, and runs on macOS or Linux without root. The Java cases use a real `keytool` (any JDK 9+ on `PATH` or `JAVA_HOME`) and are reported as skipped without one. All test input is generated in a temporary directory that is deleted afterwards. The run ends with `RESULT: N passed, N failed, N skipped` and exits 0 only when nothing failed. The fixtures in `tests/fixtures/` are public root certificates only.
+Limits: Jamf runs do not load shell profiles, so CA settings a developer exports there (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `JAVA_TOOL_OPTIONS`) are only checked when developers run the script themselves; each Jamf run lists this under "Not covered". Logs: the policy log and `/var/log/emsign-check.log`.
 
 ## FAQ
 
@@ -162,16 +144,20 @@ It needs bash, `openssl` and `perl`, and runs on macOS or Linux without root. Th
 
 **Do I need to replace our own certificates?** No, unless they were issued by eMudhra/emSign. This is about what your tools trust, not what they present.
 
-**Why does a file with only AAA Certificate Services fail?** Sectigo cross-signed all eight compromised intermediates under AAA. Tools that read a CA file directly (curl, Python, Ruby) do not check revocation, so AAA in such a file accepts the compromised chains. Java follows the same logic: Oracle's fixed builds remove AAA from `cacerts`.
+**Why does a file with only AAA Certificate Services fail?** Sectigo cross-signed all eight compromised intermediates under AAA. Tools that read a CA file directly (curl, Python, Ruby) do not check revocation, so AAA in such a file accepts the compromised chains. Since Oracle's 24 October update the same applies to Java: AAA has to be gone from `cacerts` too.
 
-**Will the fix break anything?** In Java, sites whose only chain runs to one of the four removed roots stop validating, which is the same result Oracle's fixed JDKs give. The backup next to `cacerts` restores the previous state if you need it while you investigate.
+**Will the fix break anything?** Removing the four roots from a JDK is the same change Oracle's 24 October builds make. AAA Certificate Services is an old Sectigo root and most Sectigo sites also chain to roots that stay, but a service that only chains to AAA will stop working in Java. If a build fails with a certificate path error afterwards, send the error to \<Support Team>; the backup next to `cacerts` undoes the change.
 
 **What does "affected-looking names with unrecognized keys" mean?** A certificate is named like an affected one but its key does not match the published identities. The script sends it to Review rather than guessing; compare its fingerprint with the disclosure site.
+
+**Why does a trust setting show as a FAIL?** Marking a certificate Always Trust in Keychain Access (yourself, or through a configuration profile) overrides Apple's block. The script reads the actual setting for emSign and AAA certificates in the admin and user trust settings: Always Trust is a FAIL; Never Trust or Use System Defaults passes; a setting it cannot read goes to Review. Apple's built-in root list is not an override and is never flagged.
 
 ## Sources
 
 - [eMudhra Intermediate CA Compromise – disclosure, fixed versions and certificate identities](https://emudhra.we-have-a-problem.com/)
 - [Oracle: Distrusting eMudhra intermediates in the JDK](https://ops.java/emudhra)
+- [Oracle Security Alert CVE-2026-114820 (24 October 2026)](https://www.oracle.com/security-alerts/alert-cve-2026-114820.html)
+- [Oracle JDK 21.0.13.0.3 release notes: the four roots removed](https://www.oracle.com/java/technologies/javase/21-0-13-0-3-relnotes.html)
 - [Corretto 21 issue #174: 21.0.13.0.10 fix](https://github.com/corretto/corretto-21/issues/174)
 - [Node.js 24.22.1 release](https://nodejs.org/en/blog/release/v24.22.1)
 - [Python Discourse: guidance for pip, certifi and uv](https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576)

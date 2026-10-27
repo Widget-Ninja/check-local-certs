@@ -30,11 +30,17 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes -keyout "$T
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TOP/other.key" -subj "/CN=Unrelated Test Root" -days 30 -out "$TOP/other.pem" 2>/dev/null
 openssl x509 -in "$FIX/aaa.pem" -outform DER -out "$TOP/aaa.der"
 
+# A real JDK only: its bin/ sits next to a "release" file. macOS's /usr/bin/keytool
+# and /usr/bin/java are launcher stubs that follow JAVA_HOME; linked into a test
+# JDK they would call themselves forever. As root, your user's JDKs and JAVA_HOME
+# may be invisible, so /usr/libexec/java_home is asked too.
 KEYTOOL=""; JAVA=""
-for c in "${JAVA_HOME:-}/bin/keytool" "$(command -v keytool 2>/dev/null)"; do
+MACJH=""; [ -x /usr/libexec/java_home ] && MACJH=$(/usr/libexec/java_home 2>/dev/null </dev/null)
+for c in "${JAVA_HOME:+$JAVA_HOME/bin/keytool}" "${MACJH:+$MACJH/bin/keytool}" "$(command -v keytool 2>/dev/null)"; do
   [ -n "$c" ] && [ -x "$c" ] || continue
   c=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$c")
-  [ -x "$(dirname "$c")/java" ] && "$c" -help >/dev/null 2>&1 && { KEYTOOL=$c; JAVA="$(dirname "$c")/java"; break; }
+  [ -f "$(dirname "$c")/../release" ] || continue
+  [ -x "$(dirname "$c")/java" ] && "$c" -help >/dev/null 2>&1 </dev/null && { KEYTOOL=$c; JAVA="$(dirname "$c")/java"; break; }
 done
 export KEYTOOL JAVA
 
@@ -78,7 +84,10 @@ run_one() {
   NODE_FIX=(); JDK_FIX=(); CERTIFI_FIX=(); PIP_FIX=(); UV_FIX=(); BREW_PKGS=""; KS_ROOTS=""
   security() { return 1; }
   # Only runtimes this case created count; the machine's own installs are ignored.
+  # The script's real rule stays available as real_mine for the cases that test it.
+  eval "real_mine() $(declare -f mine | tail -n +2)"
   mine() { case "$1" in "$T"/*) return 0 ;; *) return 1 ;; esac; }
+  APPLE_PY_PREFIXES="$T/no-such-apple-dir/"   # this machine's /usr/bin/python3 is not a test input
   "$fn" >"$T/stdout" 2>&1
   echo "P=$PASS F=$FAIL D=$PEND U=$UNV W=$WARN E=$ERRORS $(cat "$T/extra" 2>/dev/null)"
 }
@@ -89,8 +98,13 @@ case_() {
   local name=$1 expect=$2 fn=$3 out
   # Watchdog: a case that hangs (e.g. waiting on a prompt) fails after CASE_TIMEOUT
   # seconds instead of stalling the run.
+  # It stops the case AND every process it started (a hung child would otherwise
+  # keep the output pipe open).
   out=$(run_one "$fn" 2>&1 & pid=$!
-        perl -e 'sleep shift; kill "TERM", shift' "${CASE_TIMEOUT:-30}" "$pid" >/dev/null 2>&1 & w=$!
+        perl -e 'my ($t, $p) = @ARGV; sleep $t; my %kids;
+                 for (`ps -A -o pid= -o ppid=`) { my ($c, $d) = split; push @{$kids{$d}}, $c }
+                 my @q = ($p); my @all; while (@q) { my $x = shift @q; push @all, $x; push @q, @{$kids{$x} || []} }
+                 kill "TERM", reverse @all' "${CASE_TIMEOUT:-30}" "$pid" >/dev/null 2>&1 & w=$!
         wait "$pid"; kill "$w" 2>/dev/null)
   [ -n "$out" ] || out="TIMEOUT after ${CASE_TIMEOUT:-30}s (hung)"
   if printf '%s' "$out" | grep -Eq -- "$expect"; then
@@ -262,6 +276,14 @@ t() { cp "$FIX/aaa.pem" sys.pem; MACOS_CERT_PEM="$T/sys.pem"; audit_macos; mkrub
 case_ "macOS check + system Ruby = one vendor item, no fail" 'F=0 D=1' t
 t() { cp "$FIX/aaa.pem" own.pem; MACOS_CERT_PEM="$T/none.pem"; mkruby "$T/own.pem"; PATH="$HOME/bin:$PATH" audit_other; }
 case_ "Ruby with its own bundle containing AAA = exposure" 'F=1 D=0' t
+mkpy() { mkdir -p r; printf '#!/bin/bash\ncase "$2" in -V) echo Python 3.9.6;; -c) echo "cafile|%s";; esac\n' "$1" > r/python3; chmod +x r/python3; mkdir -p "$HOME/.pyenv/versions/s/bin"; ln -s "$T/r/python3" "$HOME/.pyenv/versions/s/bin/python3"; }
+export -f mkpy
+t() { xcode-select() { return 0; }; cp "$FIX/aaa.pem" sys.pem; MACOS_CERT_PEM="$T/sys.pem"; ln -s "$T/sys.pem" link.pem; mkpy "$T/link.pem"; PATH=/usr/bin:/bin audit_python; }
+case_ "Apple Python's ssl default on Apple's bundle = waiting on Apple" 'F=0 D=1' t
+t() { xcode-select() { return 0; }; cp "$FIX/aaa.pem" sys.pem; MACOS_CERT_PEM="$T/sys.pem"; audit_macos >/dev/null; mkpy "$T/sys.pem"; PATH=/usr/bin:/bin audit_python; }
+case_ "macOS check + Apple Python = vendor only, no fail" 'F=0 D=1' t
+t() { xcode-select() { return 0; }; cp "$FIX/aaa.pem" own.pem; MACOS_CERT_PEM="$T/none.pem"; mkpy "$T/own.pem"; PATH=/usr/bin:/bin audit_python; }
+case_ "Python ssl default on its own bundle with AAA = exposure" 'F=1 D=0' t
 
 section "macOS trust settings (parsed, not name-matched; system domain ignored)"
 # security stub: -s = real output captured on a Mac; -d / user = what each case writes.
@@ -291,6 +313,61 @@ case_ "unreadable setting = review" 'F=0 .*U=1' t
 t() { tsstub; printf 'Cert 0: AAA Certificate Services\n   Number of trust settings : 0\n' > user.txt; audit_env; }
 case_ "user Always Trust on AAA = exposure" 'F=1' t
 t() { tsstub; audit_env; };    case_ "no user trust settings = fine" 'P=1 F=0 .*U=0' t
+
+section "security review: what root may run (v3.1.4)"
+# Stubs make this testable as any user: id -u says root, owner_of/root_safe say what each path is.
+# The real rule, still limited to this case's own files.
+userule() { mine() { case "$1" in "$T"/*|/x) real_mine "$@" ;; *) return 1 ;; esac; }; }
+asroot() { id() { if [ "${1:-}" = -u ]; then echo 0; else command id "$@"; fi; }; OWNER_FILTER=1; ROLE=fleet; userule; }
+asuser() { id() { if [ "${1:-}" = -u ]; then echo 501; else command id "$@"; fi; }; OWNER_FILTER=1; ROLE=userpass; ME=dev1; userule; }
+export -f userule
+export -f asroot asuser
+t() { mkdir d; chmod 775 d; root_only d && tnote yes || tnote no; };            case_ "group-writable folder is not root-only" ' no $' t
+t() { mkdir -p w/x; chmod 777 w; : > w/x/tool; root_safe "$T/w/x/tool" && tnote safe || tnote "unsafe"; }
+case_ "file under a world-writable folder: root will not run it" ' unsafe $' t
+t() { root_safe /usr/bin/env && tnote safe || tnote unsafe; };                  case_ "sealed system path trusted" ' safe $' t
+t() { asroot; owner_of() { echo root; }; root_safe() { return 0; }; mine /x && tnote run || tnote skip; }
+case_ "root + root-owned + root-only path: runs" ' run $' t
+t() { asroot; owner_of() { echo root; }; root_safe() { ROOT_UNSAFE=/x; return 1; }; mine /x && tnote run || tnote skip; }
+case_ "root + root-owned in a writable folder: skipped" ' skip $' t
+t() { asroot; owner_of() { echo dev1; }; root_safe() { return 0; }; mine /x && tnote run || tnote skip; }
+case_ "root + user-owned: skipped (user pass checks it)" ' skip $' t
+t() { asuser; owner_of() { echo root; }; root_safe() { ROOT_UNSAFE=/x; return 1; }; mine /x && tnote run || tnote skip; }
+case_ "user pass picks up what root refused (no gap)" ' run $' t
+t() { asuser; owner_of() { echo root; }; root_safe() { return 0; }; mine /x && tnote run || tnote skip; }
+case_ "user pass leaves vetted root files to root (no duplicate)" ' skip $' t
+if [ -n "$KEYTOOL" ]; then
+  t() { mkjdk "$T/jdk" "${ALL4[@]}"; asroot; owner_of() { echo root; }
+        root_safe() { case "$1" in */bin/java) ROOT_UNSAFE=$1; return 1 ;; esac; return 0; }
+        JAVA_HOME="$T/jdk" audit_java; tnote "queued=${#JDK_FIX[@]}"; }
+  case_ "root: JDK whose java is not root-only is not run" 'P=0 F=0 .*queued=0' t
+  t() { mkjdk "$T/jdk" "${ALL4[@]}"; asroot; owner_of() { echo root; }
+        root_safe() { [ "${2:-}" = "$T/jdk" ] && { ROOT_UNSAFE="$T/jdk/lib/x"; return 1; }; return 0; }
+        JAVA_HOME="$T/jdk" audit_java; tnote "queued=${#JDK_FIX[@]}"; }
+  case_ "root: JDK home with a writable file is not run" 'P=0 F=0 .*queued=0' t
+  t() { mkjdk "$HOME/.gradle/jdks/temurin-21/jdk-21/Contents/Home" "${ALL4[@]}"; audit_java; }
+  case_ "Gradle toolchain JDK (~/.gradle/jdks) checked" 'F=1' t
+  t() { mkjdk "$HOME/Applications/GoLand.app/Contents/jbr/Contents/Home" "${ALL4[@]}"; audit_java; }
+  case_ "any JetBrains IDE runtime = waiting on vendor" 'F=0 D=1' t
+  t() { mkjdk "$HOME/Library/Application Support/JetBrains/Toolbox/apps/PyCharm-P/ch-0/253.1/PyCharm.app/Contents/jbr/Contents/Home" "${ALL4[@]}"; audit_java; }
+  case_ "JetBrains Toolbox install = waiting on vendor" 'F=0 D=1' t
+fi
+mkapy() { mkdir -p "$1/bin"; printf '#!/bin/bash\ncase "$2" in -V) echo Python 3.9.6;; -c) echo "cafile|%s"; echo "pip|21.2.4|%s";; esac\n' "$FIX/emsign-g1.pem" "$FIX/aaa.pem" > "$1/bin/python3"; chmod +x "$1/bin/python3"; }
+export -f mkapy
+t() { xcode-select() { return 0; }; mkapy "$T/Xcode.app/py"; APPLE_PY_PREFIXES="$(rp "$T")/Xcode.app/"; mkdir -p "$HOME/.pyenv/versions/x/bin"; ln -s "$T/Xcode.app/py/bin/python3" "$HOME/.pyenv/versions/x/bin/python3"
+      PATH=/usr/bin:/bin audit_python; tnote "queued=${#PIP_FIX[@]}"; }
+case_ "Xcode's pip = waiting on Apple, never queued" 'F=0 D=1 .*queued=0' t
+t() { xcode-select() { return 0; }; mkapy "$T/Xcode.app/py"; APPLE_PY_PREFIXES="$(rp "$T")/Xcode.app/"; mkdir -p "$HOME/.pyenv/versions/x/bin"; ln -s "$T/Xcode.app/py/bin/python3" "$HOME/.pyenv/versions/x/bin/python3"
+      asroot; PATH=/usr/bin:/bin audit_python; }
+case_ "root never runs Apple's Python" 'P=0 F=0 D=0 U=0' t
+t() { xcode-select() { return 0; }; mkapy "$HOME/.local/share/uv/python/cpython-3.12.7-macos-aarch64-none"; PATH=/usr/bin:/bin audit_python; tnote "queued=${#PIP_FIX[@]}"; }
+case_ "uv-managed Python checked (old pip = exposure, queued)" 'F=1 .*queued=1' t
+mkuv() { mkdir -p "$HOME/.local/bin"; printf '#!/bin/bash\necho "uv %s (Homebrew 2026-10-21)"\n' "$1" > "$HOME/.local/bin/uv"; chmod +x "$HOME/.local/bin/uv"; }
+export -f mkuv
+t() { mkuv 0.13.4; audit_uv; };  case_ "uv 0.13.4 = exposure (only dropped the root)" 'P=0 F=1' t
+t() { mkuv 0.13.5; audit_uv; };  case_ "uv 0.13.5 = fixed (key-based block)" 'P=1 F=0' t
+t() { ROLE=userpass; audit_env; printf '%s\n' "${NOT_COVERED[@]}" | grep -q 'shell profiles' && tnote listed; }
+case_ "Jamf user pass lists shell-profile settings as not covered" 'listed' t
 
 section "environment and shell files (bypasses, GIT_SSL_NO_VERIFY=false, PIP_TRUSTED_HOST)"
 t() { NODE_TLS_REJECT_UNAUTHORIZED=0 audit_env; };       case_ "NODE_TLS_REJECT_UNAUTHORIZED=0 = exposure" 'F=1' t
