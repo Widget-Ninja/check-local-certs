@@ -4,8 +4,8 @@ Scripts for the October 2026 eMudhra/emSign intermediate certificate compromise.
 
 | File | What it is |
 | --- | --- |
-| `jamf-emsign.sh` | The audit and remediation script (v3.1.0). Bash 3.2, no dependencies beyond macOS. |
-| `tests/run-tests.sh` | Test suite for `jamf-emsign.sh`, with public certificate fixtures in `tests/fixtures/`. |
+| `jamf-emsign.sh` | The audit and remediation script (v3.1.4). Bash 3.2, no dependencies beyond macOS. |
+| `tests/run-tests.sh` | Test suite for `jamf-emsign.sh`, with fixtures in `tests/fixtures/`. |
 | `eMudhra Certificate Remediation: Developer Mac Guide.md` | Guide for developers: what happened, what each finding means and how to fix it by hand. |
 | `emsign-check.sh` | The earlier developer-only script, kept for reference. Its guide is in `docs/emsign-check-guide.md`. |
 
@@ -44,7 +44,7 @@ WARN lines are advisories and never change the status. For what each finding mea
 
 ## Run it in Jamf
 
-As a Jamf policy the script runs as root. It does a system pass, then one pass per local user (UID 501 and up, with a home folder), each run as that user with a clean environment. Root never executes a binary a user owns. In `remediate` mode only Java is changed unattended; Node, Homebrew, pip and uv need the developer, so they are reported as actions.
+As a Jamf policy the script runs as root. It does a system pass, then one pass per local user (UID 501 and up, with a home folder), each run as that user with a clean environment. Root only runs a program that is owned by root, sits in root-owned folders nobody else can write to, and (for a JDK, Python or Ruby) whose install folder holds nothing writable by others; Apple's Xcode Python is never run as root. Anything root refuses is checked in the user passes instead, as that user. In `remediate` mode only Java is changed unattended; Node, Homebrew, pip and uv need the developer, so they are reported as actions.
 
 ### 1. Add the script
 
@@ -109,6 +109,7 @@ tests/run-tests.sh path/to/jamf-emsign.sh # tests another copy
 
 - **Needs** bash, `openssl` and `perl`. The Java cases use a real `keytool` from `JAVA_HOME` or `PATH` (any JDK 9+); without one they are reported as skipped.
 - **Safe to run anywhere**: macOS or Linux, no root needed. The suite sources the script, which loads its functions without starting a pass. All test input is generated in a temporary directory that is deleted afterwards.
-- **Output**: one line per case grouped by area (bundles, certificate directories, keytool, Java policy, cross-signed path, environment, Node, Go, Gradle, Python, exit contract, command line), then `RESULT: N passed, N failed, N skipped`. The exit code is 0 only when nothing failed.
+- **Hangs fail fast**: each case is stopped after `CASE_TIMEOUT` seconds (default 30; the slowest case takes about 8) and counted as a failure. Raise it on a slow machine: `CASE_TIMEOUT=60 tests/run-tests.sh`.
+- **Output**: one line per case grouped by area (bundles, certificate directories, keytool, Java policy, cross-signed path, macOS `/etc/ssl/cert.pem` and Ruby, macOS trust settings, what root may run, environment, Node, Go, Gradle, Python, exit contract, command line), then `RESULT: N passed, N failed, N skipped`. The exit code is 0 only when nothing failed.
 
-The fixtures in `tests/fixtures/` are public root certificates only; `tests/fixtures/README.md` lists each one with its fingerprints and source.
+The fixtures in `tests/fixtures/` are public root certificates and a sample of macOS's built-in trust-settings listing, with no private keys. `tests/fixtures/README.md` lists each one with its source.
